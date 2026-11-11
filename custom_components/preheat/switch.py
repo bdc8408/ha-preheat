@@ -29,7 +29,9 @@ async def async_setup_entry(
     async_add_entities([
         PreheatingSwitch(coordinator, entry),
         PreheatHoldSwitch(coordinator, entry),
-        PreheatEnabledSwitch(coordinator, entry)
+        PreheatEnabledSwitch(coordinator, entry),
+        # Fork Phase 4: away mode (Ben, Nov 10).
+        PreheatAwayModeSwitch(coordinator, entry),
     ])
 
 
@@ -153,3 +155,66 @@ class PreheatEnabledSwitch(CoordinatorEntity["PreheatingCoordinator"], SwitchEnt
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Disable."""
         await self.coordinator.set_enabled(False)
+
+
+class PreheatAwayModeSwitch(CoordinatorEntity["PreheatingCoordinator"], SwitchEntity):
+    """Away-mode switch: hold a deep low-energy setback while on a trip.
+
+    While on, the learned schedule is overridden (away wins) and the
+    blueprint holds the away setpoint instead of the routine. If a
+    return date/time is set, the house warms back to Comfort by the
+    return time. Turning off resumes the normal learned drive and
+    clears the return time. Persisted across restarts (unlike the
+    manual hold): a restart must not silently cancel a trip and heat
+    an empty house.
+    """
+
+    _attr_icon = "mdi:home-export-outline"
+    _attr_has_entity_name = True
+    _attr_translation_key = "away_mode"
+
+    def __init__(self, coordinator: PreheatingCoordinator, entry: PreheatConfigEntry) -> None:
+        """Initialize the switch."""
+        super().__init__(coordinator)
+        self.entry_id = entry.entry_id
+        self._attr_unique_id = f"{entry.entry_id}_away_mode"
+
+    @cached_property
+    def device_info(self) -> DeviceInfo:
+        """Return device information."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.entry_id)},
+            name=self.coordinator.device_name,
+            manufacturer="Ecronika",
+            model="Intelligent Preheating",
+            sw_version=VERSION,
+        )
+
+    @property
+    def is_on(self) -> bool:
+        """Return true if away mode is active."""
+        return self.coordinator.away_mode
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return away-mode state."""
+        data = self.coordinator.data
+        attrs: dict[str, Any] = {
+            "away_setback_active": data.away_setback_active,
+            "away_preheat": data.away_preheat,
+        }
+        if data.away_setpoint is not None:
+            attrs["away_setpoint_f"] = round(data.away_setpoint * 9.0 / 5.0 + 32.0, 1)
+        if data.away_return_dt is not None:
+            attrs["away_return"] = data.away_return_dt.isoformat()
+        if data.away_return_preheat_start is not None:
+            attrs["return_preheat_start"] = data.away_return_preheat_start.isoformat()
+        return attrs
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn on away mode."""
+        await self.coordinator.set_away_mode(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn off away mode."""
+        await self.coordinator.set_away_mode(False)

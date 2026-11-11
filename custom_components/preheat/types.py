@@ -36,13 +36,16 @@ class Prediction(TypedDict):
     uncapped_duration: float       # Theoretical duration (minutes)
     buffer_min: float              # Configured comfort buffer (minutes)
     lead_time: float               # predicted_duration + buffer, capped by max_preheat_hours
-    
+
     delta_in: float  # Target - Internal Temp
     delta_out: float # Target - External Temp (effective)
-    
+
     prognosis: Literal["ok", "limited", "extrapolated", "fallback"]
     weather_available: bool
     limit_exceeded: bool
+    # Fork Phase 4: which model produced predicted_duration —
+    # "physics" (ThermalPhysics) or "thermal_learner" (fitted rate).
+    duration_source: str
 
 class Decision(TypedDict):
     """The result of the start/stop decision logic."""

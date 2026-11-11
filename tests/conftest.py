@@ -110,6 +110,11 @@ if "homeassistant" not in sys.modules:
     ha.components.switch = MagicMock()
     ha.components.switch.SwitchEntity = _EntityStub
     sys.modules["homeassistant.components.switch"] = ha.components.switch
+
+    # Fork Phase 4: away-return datetime entity.
+    ha.components.datetime = MagicMock()
+    ha.components.datetime.DateTimeEntity = _EntityStub
+    sys.modules["homeassistant.components.datetime"] = ha.components.datetime
     
     sys.modules["homeassistant.components"] = ha.components
     sys.modules["homeassistant.components.sensor"] = ha.components.sensor

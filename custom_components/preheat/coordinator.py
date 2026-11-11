@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, date, timezone
+from datetime import datetime, timedelta, date, time, timezone
 import logging
 from typing import Any, TYPE_CHECKING
 
@@ -28,6 +28,7 @@ from .units import (
     detect_climate_unit,
     detect_outdoor_unit,
     detect_sensor_unit,
+    fahrenheit_delta_to_celsius,
     fahrenheit_to_celsius,
     hass_temperature_unit,
     to_celsius,
@@ -55,6 +56,15 @@ from .const import (
     CONF_ARRIVAL_WINDOW_START,
     CONF_ARRIVAL_WINDOW_END,
     CONF_VALVE_POSITION,
+    CONF_MOTION_SENSORS,
+    CONF_DRIVE_MODE,
+    DEFAULT_DRIVE_MODE,
+    CONF_HALLWAY_LIGHTS,
+    CONF_QUIET_MINUTES,
+    DEFAULT_QUIET_MINUTES,
+    CONF_AWAY_OFFSET_F,
+    DEFAULT_AWAY_OFFSET_F,
+    AWAY_SETPOINT_FLOOR_F,
     CONF_DEBOUNCE_MIN,
     CONF_PHYSICS_MODE,
     PHYSICS_STANDARD,
@@ -119,6 +129,8 @@ from .const import (
 from .planner import PreheatPlanner
 from .patterns import MIN_CLUSTER_POINTS
 from .physics import ThermalPhysics, ThermalModelData
+from .schedule_learner import ScheduleLearner, day_type_for
+from .thermal_learner import ThermalLearner
 from .history_buffer import RingBuffer, DeadtimeAnalyzer, HistoryPoint
 from .weather_service import WeatherService
 from .optimal_stop import OptimalStopManager
@@ -136,6 +148,23 @@ _LOGGER = logging.getLogger(__name__)
 
 STORAGE_VERSION = 4 
 STORAGE_KEY_TEMPLATE = "preheat.{}"
+
+def _next_time_of_day(now: datetime, minutes: int) -> datetime:
+    """Next datetime at ``minutes`` since local midnight.
+
+    ``minutes`` may exceed 1440 (e.g. a 01:30 bedtime is 1530 minutes
+    from the evening's midnight). If the time already passed today, the
+    next day's occurrence is returned.
+    """
+    days_ahead, mins = divmod(minutes, 24 * 60)
+    target_date = now.date() + timedelta(days=days_ahead)
+    candidate = datetime.combine(
+        target_date, time(mins // 60, mins % 60), tzinfo=now.tzinfo
+    )
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
+
 
 @dataclass(frozen=True)
 class PreheatData:
@@ -188,6 +217,33 @@ class PreheatData:
     hvac_mode: str | None = None
     start_source: str = "none"
 
+    # Fork Phase 4: learned schedule + explicit thermal model (DRIVE mode
+    # — Ben, Nov 10; the learned signals drive the blueprint's occupancy /
+    # sleep / wake inputs). Away mode overrides them while active.
+    learned_occupancy_prob: float = 0.0
+    learned_next_arrival: datetime | None = None
+    learned_next_departure: datetime | None = None
+    learned_wake_time: datetime | None = None
+    learned_bedtime_time: datetime | None = None
+    learned_schedule_confidence: float = 0.0
+    learned_schedule_suggestion: dict[str, Any] | None = None
+    learned_sleeping: bool = False
+    learned_wake_window: bool = False
+    learned_drive_mode: bool = True
+    heating_rate_f_per_h: float | None = None
+    cooling_rate_f_per_h: float | None = None
+    heat_loss_min_per_f: float | None = None
+    thermal_duration_source: str = "physics"
+    thermal_episodes: int = 0
+    # Fork Phase 4: away mode (Ben, Nov 10). The fork never writes the
+    # thermostat; these are signals the blueprint consumes.
+    away_mode: bool = False
+    away_setback_active: bool = False
+    away_preheat: bool = False
+    away_setpoint: float | None = None  # °C internally; displayed °F
+    away_return_dt: datetime | None = None
+    away_return_preheat_start: datetime | None = None
+
 class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
     """Coordinator to manage preheating logic."""
 
@@ -222,6 +278,19 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         # V2.5: Optimal Stop
         self.optimal_stop_manager = OptimalStopManager(hass)
         self.cooling_analyzer = CoolingAnalyzer()
+
+        # Fork Phase 4: schedule learning + explicit thermal model.
+        # DRIVE mode (Ben, Nov 10): the learned signals drive the
+        # blueprint's occupancy / sleep / wake inputs.
+        self.schedule_learner = ScheduleLearner(
+            quiet_minutes=self._quiet_minutes()
+        )
+        self.thermal_learner = ThermalLearner()
+        # Fork Phase 4: away mode (Ben, Nov 10). Persisted in the store
+        # (unlike the manual hold): a trip lasts days and a restart must
+        # not silently cancel it and heat an empty house.
+        self.away_mode: bool = False
+        self.away_return_dt: datetime | None = None
         self.session_resolver = None
         self._last_cooling_analysis = None
         self.tau_revalidated = False
@@ -421,6 +490,15 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             value = float(DEFAULT_BUFFER_MIN)
         return max(0.0, min(60.0, value))
 
+    def _sync_thermal_learner(self) -> None:
+        """Pull deadtime / loss / cooling-tau into the explicit thermal model."""
+        self.thermal_learner.sync(
+            deadtime_min=self.physics.deadtime,
+            loss_factor_min_per_k=self.physics.loss_factor,
+            cooling_tau_hours=self.cooling_analyzer.learned_tau,
+            cooling_confidence=self.cooling_analyzer.confidence,
+        )
+
     async def async_load_data(self) -> None:
         """Load learned data from storage."""
         try:
@@ -497,6 +575,18 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                 
                 self.cooling_analyzer.learned_tau = loaded_tau
                 self.cooling_analyzer.confidence = loaded_conf
+
+                # Fork Phase 4: restore learned schedule + thermal model.
+                self.schedule_learner = ScheduleLearner.from_dict(
+                    data.get("schedule_learning")
+                )
+                self.thermal_learner = ThermalLearner.from_dict(
+                    data.get("thermal_learning")
+                )
+                self._sync_thermal_learner()
+                # The stored quiet window is from the previous config;
+                # the current option wins.
+                self._sync_quiet_minutes()
                 
                 # Load Shadow Savings
                 self._shadow_metrics["cumulative_shadow_savings"] = data.get("cumulative_shadow_savings", 0.0)
@@ -575,6 +665,27 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
 
             # Load Enable State (Default True)
             self.enable_active = data.get("enable_active", True)
+
+            # Fork Phase 4: away mode (persisted; a restart must not
+            # silently cancel a trip and heat an empty house).
+            self.away_mode = bool(data.get("away_mode", False))
+            away_return = data.get("away_return")
+            self.away_return_dt = None
+            if isinstance(away_return, str):
+                try:
+                    parsed = datetime.fromisoformat(away_return)
+                    if parsed.tzinfo is None:
+                        # A stored return without a timezone cannot be
+                        # compared safely; ignore it rather than crash
+                        # the update cycle on a naive/aware mismatch.
+                        _LOGGER.warning(
+                            "Ignoring timezone-naive stored away_return: %s",
+                            away_return,
+                        )
+                    elif parsed > dt_util.now():
+                        self.away_return_dt = parsed
+                except ValueError:
+                    _LOGGER.warning("Ignoring unparseable stored away_return: %s", away_return)
             
             # Load Bootstrap State FIRST (before scheduling timer)
             self.bootstrap_done = data.get("bootstrap_done", False)
@@ -623,6 +734,12 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             "diagnostics": self.diagnostics.data,
             # V2.9.2
             "bootstrap_done": self.bootstrap_done,
+            # Fork Phase 4: learned schedule + explicit thermal model.
+            "schedule_learning": self.schedule_learner.to_dict(),
+            "thermal_learning": self.thermal_learner.to_dict(),
+            # Fork Phase 4: away mode (persisted across restarts).
+            "away_mode": self.away_mode,
+            "away_return": self.away_return_dt.isoformat() if self.away_return_dt else None,
         }
 
     async def _async_save_data(self) -> None:
@@ -640,6 +757,12 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                 stored_data["enable_active"] = self.enable_active
                 stored_data["diagnostics"] = self.diagnostics.data
                 stored_data["cumulative_shadow_savings"] = self._shadow_metrics.get("cumulative_shadow_savings", 0.0)
+                # Fork Phase 4: keep learned state even when temperature data is missing.
+                stored_data["schedule_learning"] = self.schedule_learner.to_dict()
+                stored_data["thermal_learning"] = self.thermal_learner.to_dict()
+                # Fork Phase 4: away mode is non-thermal state; keep it too.
+                stored_data["away_mode"] = self.away_mode
+                stored_data["away_return"] = self.away_return_dt.isoformat() if self.away_return_dt else None
                 
                 await self._store.async_save(stored_data)
                 return
@@ -757,9 +880,123 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                 await self._async_save_data()
             else:
                  _LOGGER.warning("DEBUG: Scan complete but found 0 events (Arrivals: %d, Departures: %d)", count_arrival, count_departure)
+
+            # Fork Phase 4: feed the same occupancy history into the
+            # schedule learner (per-day slot occupancy), so the learned
+            # routine starts from real days instead of only the prior.
+            try:
+                pairs = [
+                    (dt_util.as_local(s.last_changed), s.state) for s in states
+                ]
+                before = self.schedule_learner.days_of_data
+                self.schedule_learner.ingest_state_history(pairs)
+                _LOGGER.info(
+                    "Schedule learning backfill: %d days of occupancy history "
+                    "(%d days before)",
+                    self.schedule_learner.days_of_data - before,
+                    before,
+                )
+            except Exception as e:
+                _LOGGER.warning("Schedule learning backfill failed: %s", e)
+
+            await self._backfill_motion_history(start_date)
+            # Fork Phase 4 (drive update): backfill the holistic quiet
+            # signal from media + hallway-light history so bedtime/wake
+            # learning starts from real days, not just motion.
+            await self._backfill_quiet_history(start_date)
                 
         except Exception as e:
             _LOGGER.error("Error analyzing history: %s", e)
+
+    async def _backfill_motion_history(self, start_date: datetime) -> None:
+        """Backfill bedtime/wake learning from hallway-motion history.
+
+        Only runs when motion sensors are configured (CONF_MOTION_SENSORS).
+        Without them, bedtime/wake stay at the fixed-schedule prior.
+        """
+        motion_sensors = self._get_conf(CONF_MOTION_SENSORS) or []
+        if not motion_sensors:
+            return
+        try:
+            from homeassistant.components.recorder import history, get_instance
+
+            history_data = await get_instance(self.hass).async_add_executor_job(
+                history.get_significant_states,
+                self.hass,
+                start_date,
+                None,
+                list(motion_sensors),
+            )
+            if not history_data:
+                return
+            motion_times: list[datetime] = []
+            for entity_id in motion_sensors:
+                for state in history_data.get(entity_id, []):
+                    if state.state == STATE_ON:
+                        motion_times.append(dt_util.as_local(state.last_changed))
+            if motion_times:
+                self.schedule_learner.ingest_motion_history(sorted(motion_times))
+                _LOGGER.info(
+                    "Schedule learning backfill: %d motion events from %d sensor(s)",
+                    len(motion_times),
+                    len(motion_sensors),
+                )
+        except Exception as e:
+            _LOGGER.warning("Motion history backfill failed: %s", e)
+
+    async def _backfill_quiet_history(self, start_date: datetime) -> None:
+        """Backfill the quiet detector from media + hallway-light history.
+
+        Media (all media_player entities, domain-wide) and hallway-light
+        "on" events are fed into the learner so bedtime/wake learning
+        starts from real days instead of only the prior. Missing entities
+        or an empty recorder simply leave the detector with less data;
+        the learner degrades to motion-only. Called after the motion
+        backfill; sleep derivation is idempotent, so backfill order
+        does not double-count.
+        """
+        try:
+            from homeassistant.components.recorder import history, get_instance
+
+            media_ids = self.hass.states.async_entity_ids("media_player")
+            light_ids = list(self._get_conf(CONF_HALLWAY_LIGHTS) or [])
+            entity_ids = list(media_ids) + light_ids
+            if not entity_ids:
+                return
+            history_data = await get_instance(self.hass).async_add_executor_job(
+                history.get_significant_states,
+                self.hass,
+                start_date,
+                None,
+                entity_ids,
+            )
+            if not history_data:
+                return
+            media_pairs: list[tuple[datetime, bool]] = []
+            for entity_id in media_ids:
+                for state in history_data.get(entity_id, []):
+                    if state.state in ("unavailable", "unknown"):
+                        continue
+                    media_pairs.append(
+                        (dt_util.as_local(state.last_changed), state.state == "playing")
+                    )
+            if media_pairs:
+                self.schedule_learner.ingest_media_history(sorted(media_pairs))
+            light_times: list[datetime] = []
+            for entity_id in light_ids:
+                for state in history_data.get(entity_id, []):
+                    if state.state == STATE_ON:
+                        light_times.append(dt_util.as_local(state.last_changed))
+            if light_times:
+                self.schedule_learner.ingest_activity_history(sorted(light_times))
+            if media_pairs or light_times:
+                _LOGGER.info(
+                    "Quiet backfill: %d media state changes, %d hallway-light events",
+                    len(media_pairs),
+                    len(light_times),
+                )
+        except Exception as e:
+            _LOGGER.warning("Quiet history backfill failed: %s", e)
 
     def _setup_listeners(self) -> None:
         """Setup event listeners for state changes."""
@@ -771,6 +1008,37 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                     self.hass, [occupancy_sensor], self._handle_occupancy_change
                 )
             )
+
+        # 1b. Fork Phase 4: hallway-motion sensors feed bedtime/wake
+        # learning. Optional — without them the learner keeps the prior.
+        motion_sensors = self._get_conf(CONF_MOTION_SENSORS) or []
+        if motion_sensors:
+            self.entry.async_on_unload(
+                async_track_state_change_event(
+                    self.hass, list(motion_sensors), self._handle_motion_change
+                )
+            )
+
+        # 1c. Fork Phase 4 (drive update): holistic quiet detection.
+        # Any media_player playing anywhere means the house is awake
+        # (tracked domain-wide, not a hardcoded list), and hallway
+        # lights turning on count as hallway activity alongside motion.
+        # Missing entities never break the update cycle: the handlers
+        # ignore unknown/unavailable states, and the learner degrades
+        # to motion-only when no media/light data exists.
+        self.entry.async_on_unload(
+            async_track_state_change_event(
+                self.hass, ["media_player"], self._handle_media_change
+            )
+        )
+        hallway_lights = self._get_conf(CONF_HALLWAY_LIGHTS) or []
+        if hallway_lights:
+            self.entry.async_on_unload(
+                async_track_state_change_event(
+                    self.hass, list(hallway_lights), self._handle_hallway_light_change
+                )
+            )
+        self._seed_quiet_state()
 
         # 2. Climate & Temperature (Reactive Setpoints / Frost Protection - Action 3.3)
         # We want to react immediately if the user changes the setpoint manually on the TRV
@@ -798,6 +1066,67 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         # The Debouncer in _async_update_data handles rate limiting if needed,
         # but here we want to ensure we catch the edge.
         self.hass.async_create_task(self.async_request_refresh())
+
+    @callback
+    def _handle_motion_change(self, event) -> None:
+        """Feed hallway-motion events into sleep/wake learning (Phase 4)."""
+        new_state = event.data.get("new_state")
+        old_state = event.data.get("old_state")
+        if not new_state or not old_state:
+            return
+        if new_state.state == STATE_ON and old_state.state != STATE_ON:
+            self.schedule_learner.record_motion(dt_util.as_local(dt_util.now()))
+
+    @callback
+    def _handle_media_change(self, event) -> None:
+        """Feed any media_player state change into the quiet detector.
+
+        Domain-wide (not a hardcoded list): any media playing anywhere
+        means the house is awake, which blocks a bedtime call.
+        Unavailable/unknown states are ignored (they say nothing about
+        whether media is playing).
+        """
+        new_state = event.data.get("new_state")
+        if not new_state:
+            return
+        if new_state.state in ("unavailable", "unknown"):
+            return
+        self.schedule_learner.record_media(
+            dt_util.as_local(dt_util.now()), new_state.state == "playing"
+        )
+
+    @callback
+    def _handle_hallway_light_change(self, event) -> None:
+        """Feed hallway-light-on events into the quiet detector (activity)."""
+        new_state = event.data.get("new_state")
+        old_state = event.data.get("old_state")
+        if not new_state or not old_state:
+            return
+        if new_state.state == STATE_ON and old_state.state != STATE_ON:
+            self.schedule_learner.record_light(dt_util.as_local(dt_util.now()))
+
+    def _seed_quiet_state(self) -> None:
+        """Seed the quiet detector with current media/light states.
+
+        Listeners only fire on changes; without seeding, a TV already
+        playing (or a light already on) at startup would be invisible
+        until it next changed state. Missing entities are ignored.
+        """
+        now = dt_util.as_local(dt_util.now())
+        try:
+            for entity_id in self.hass.states.async_entity_ids("media_player"):
+                state = self.hass.states.get(entity_id)
+                if state is not None and state.state not in ("unavailable", "unknown"):
+                    self.schedule_learner.record_media(now, state.state == "playing")
+        except Exception as err:  # never break setup on a seeding failure
+            _LOGGER.debug("Quiet seeding (media) skipped: %s", err)
+        try:
+            for entity_id in self._get_conf(CONF_HALLWAY_LIGHTS) or []:
+                state = self.hass.states.get(entity_id)
+                if state is not None and state.state == STATE_ON:
+                    self.schedule_learner.record_light(now)
+        except Exception as err:
+            _LOGGER.debug("Quiet seeding (lights) skipped: %s", err)
 
     @callback
     def _handle_occupancy_change(self, event) -> None:
@@ -1145,6 +1474,11 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         is_occupied = False
         if occ_sensor and self.hass.states.is_state(occ_sensor, STATE_ON):
             is_occupied = True
+
+        # Fork Phase 4: one occupancy observation per cycle for the
+        # schedule learner, and refresh the explicit thermal model.
+        self.schedule_learner.record_tick(now, is_occupied)
+        self._sync_thermal_learner()
             
         # Window (Attribute based or internal status)
         is_window = self._window_open_detected
@@ -1249,7 +1583,8 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         
         outdoor_effective = ctx["outdoor_temp"] if ctx["outdoor_temp"] is not None else 10.0
         weather_avail = False
-        
+        duration_source = "physics"  # Fork Phase 4; the static branch may switch it.
+
         # Forecast Integration (Restored Iterative Logic v3)
         if ctx["forecasts"] and self.weather_service:
             weather_avail = True
@@ -1278,9 +1613,28 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
              # Standard Static Calc
              # delta_in calculated above
              delta_out = ctx["target_setpoint"] - outdoor_effective
-             predicted_duration = self.physics.calculate_duration(
+             physics_duration = self.physics.calculate_duration(
                  delta_in, delta_out
              )
+             # Fork Phase 4: once the explicit thermal model is confident,
+             # its fitted heating rate drives the start time. Guard: if it
+             # disagrees with the physics model by >50%, trust physics and
+             # log the disagreement (a bad regression must not move heat).
+             duration_source = "physics"
+             predicted_duration = physics_duration
+             thermal_duration = self.thermal_learner.predict_duration_min(
+                 delta_in, outdoor_effective
+             )
+             if thermal_duration is not None and physics_duration > 0:
+                 if abs(thermal_duration - physics_duration) / physics_duration <= 0.5:
+                     predicted_duration = thermal_duration
+                     duration_source = "thermal_learner"
+                 else:
+                     _LOGGER.warning(
+                         "[%s] Thermal-learner duration %.0f min disagrees with "
+                         "physics %.0f min (>50%%); using physics",
+                         self.device_name, thermal_duration, physics_duration,
+                     )
              uncapped_duration = predicted_duration
 
         # Limit Check (v3 Fix)
@@ -1301,7 +1655,8 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             "lead_time": lead_time,
             "delta_in": delta_in, "delta_out": delta_out, 
             "prognosis": "ok", "weather_available": weather_avail,
-            "limit_exceeded": (uncapped_duration > max_preheat)
+            "limit_exceeded": (uncapped_duration > max_preheat),
+            "duration_source": duration_source,
         }
 
     def _update_optimal_stop_and_savings(
@@ -1482,6 +1837,17 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                 blocked_reasons.append("window_open")
             if self.hold_active:
                 blocked_reasons.append("manual_hold")
+            # Fork Phase 4 (away mode): while the deep setback is active,
+            # the normal arrival pre-heat must not fire (the house is
+            # empty regardless of routine). During the return warm-up
+            # window the block lifts (the separate away_preheat signal
+            # drives the warm-up; the normal signal is harmless there).
+            if self.away_mode:
+                away = self._away_state(
+                    now, ctx["target_setpoint"], ctx["outdoor_temp"]
+                )
+                if away["away_setback_active"]:
+                    blocked_reasons.append("away_mode")
 
             if blocked_reasons:
                 blocked = True
@@ -1722,8 +2088,215 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             self._target_reached_temp = operative_temp
             _LOGGER.debug("[%s] Preheat target reached at %.1f", self.device_name, operative_temp)
 
+    # -- Fork Phase 4: away mode -----------------------------------------
+
+    def _away_setpoint_c(self, comfort_c: float) -> float:
+        """Deep-setback target (°C) while away: Comfort minus the offset.
+
+        Clamped to the away floor (61°F, the blueprint safety floor) so
+        the house never drops into a freeze risk.
+        """
+        try:
+            offset_f = float(
+                self._get_conf(CONF_AWAY_OFFSET_F, DEFAULT_AWAY_OFFSET_F)
+                or DEFAULT_AWAY_OFFSET_F
+            )
+        except (TypeError, ValueError):
+            offset_f = DEFAULT_AWAY_OFFSET_F
+        away_c = comfort_c - fahrenheit_delta_to_celsius(offset_f)
+        return max(away_c, fahrenheit_to_celsius(AWAY_SETPOINT_FLOOR_F))
+
+    def _away_heat_duration_min(
+        self, delta_c: float, outdoor_c: float, comfort_c: float
+    ) -> float:
+        """Minutes to warm from the away setpoint back to Comfort.
+
+        Same model as the arrival pre-heat: the fitted thermal-learner
+        rate once confident (>= 5 episodes), with the >50% disagreement
+        guard falling back to the physics model.
+        """
+        if delta_c <= 0:
+            return 0.0
+        physics_duration = self.physics.calculate_duration(
+            delta_c, max(0.0, comfort_c - outdoor_c)
+        )
+        thermal_duration = self.thermal_learner.predict_duration_min(
+            delta_c, outdoor_c
+        )
+        if thermal_duration is not None and physics_duration > 0:
+            if abs(thermal_duration - physics_duration) / physics_duration <= 0.5:
+                return thermal_duration
+            _LOGGER.warning(
+                "[%s] Away return: thermal-learner duration %.0f min disagrees "
+                "with physics %.0f min by >50%%; using physics",
+                self.device_name,
+                thermal_duration,
+                physics_duration,
+            )
+        return physics_duration
+
+    def _away_return_preheat_start(
+        self, now: datetime, comfort_c: float, outdoor_c: float
+    ) -> datetime | None:
+        """When return pre-heat should start (None if no return set / past)."""
+        if not self.away_mode or self.away_return_dt is None:
+            return None
+        ret = self.away_return_dt
+        if ret <= now:
+            return None
+        delta_c = comfort_c - self._away_setpoint_c(comfort_c)
+        duration = self._away_heat_duration_min(delta_c, outdoor_c, comfort_c)
+        return ret - timedelta(minutes=duration + self._get_buffer_minutes())
+
+    def _away_state(
+        self, now: datetime, comfort_c: float | None, outdoor_c: float | None
+    ) -> dict:
+        """Away-mode state for the snapshot and the start decision.
+
+        away_setback_active: deep-setback phase (away on, return window
+        not reached). away_preheat: return warm-up window (away on, a
+        return time is set, and now is within [return_start, return)).
+        While away is on, the learned drive signals are forced off (away
+        wins over the routine) until away mode is switched off.
+        """
+        defaults = {
+            "away_mode": self.away_mode,
+            "away_setback_active": False,
+            "away_preheat": False,
+            "away_setpoint": None,
+            "away_return_dt": self.away_return_dt,
+            "away_return_preheat_start": None,
+        }
+        if not self.away_mode or comfort_c is None:
+            return defaults
+        outdoor = outdoor_c if outdoor_c is not None else 10.0
+        setpoint_c = self._away_setpoint_c(comfort_c)
+        start = self._away_return_preheat_start(now, comfort_c, outdoor)
+        in_return_window = (
+            start is not None
+            and self.away_return_dt is not None
+            and start <= now < self.away_return_dt
+        )
+        return {
+            **defaults,
+            "away_setback_active": not in_return_window,
+            "away_preheat": in_return_window,
+            "away_setpoint": round(setpoint_c, 2),
+            "away_return_preheat_start": start,
+        }
+
+    def _quiet_minutes(self) -> int:
+        """Configured sustained-quiet window for a bedtime (minutes)."""
+        try:
+            value = int(
+                self._get_conf(CONF_QUIET_MINUTES, DEFAULT_QUIET_MINUTES)
+                or DEFAULT_QUIET_MINUTES
+            )
+        except (TypeError, ValueError):
+            value = DEFAULT_QUIET_MINUTES
+        return max(5, min(120, value))
+
+    def _sync_quiet_minutes(self) -> None:
+        """Apply the configured quiet window to the learner's detector.
+
+        The stored value is from the previous config; the current
+        option wins so an options change takes effect after a reload.
+        """
+        self.schedule_learner.quiet_detector.quiet_minutes = self._quiet_minutes()
+
+    def _phase4_snapshot(self, ctx: Context, pred: Prediction) -> dict:
+        """Learned-schedule + thermal-model + away-mode values for PreheatData.
+
+        DRIVE mode (Ben, Nov 10): the learned-occupancy / sleeping /
+        wake-window values are the blueprint's schedule inputs. Away mode
+        overrides them while active (away wins over the routine). Any
+        failure (e.g. the mocked clock in tests) falls back to
+        prior/None values instead of breaking the update cycle.
+        """
+        defaults = {
+            "learned_occupancy_prob": 0.0,
+            "learned_next_arrival": None,
+            "learned_next_departure": None,
+            "learned_wake_time": None,
+            "learned_bedtime_time": None,
+            "learned_schedule_confidence": 0.0,
+            "learned_schedule_suggestion": None,
+            "learned_sleeping": False,
+            "learned_wake_window": False,
+            "learned_drive_mode": True,
+            "heating_rate_f_per_h": None,
+            "cooling_rate_f_per_h": None,
+            "heat_loss_min_per_f": None,
+            "thermal_duration_source": pred.get("duration_source", "physics"),
+            "thermal_episodes": 0,
+            "away_mode": self.away_mode,
+            "away_setback_active": False,
+            "away_preheat": False,
+            "away_setpoint": None,
+            "away_return_dt": self.away_return_dt,
+            "away_return_preheat_start": None,
+        }
+        try:
+            now = ctx["now"]
+            learner = self.schedule_learner
+            dtype = day_type_for(now.date())
+            next_transition, transition_kind, _ = learner.predict_next_transition(now)
+            wake_min, _, _ = learner.learned_wake(dtype)
+            bedtime_min, _, _ = learner.learned_bedtime(dtype)
+            outdoor = ctx["outdoor_temp"] if ctx["outdoor_temp"] is not None else 10.0
+            drive_mode = bool(self._get_conf(CONF_DRIVE_MODE, DEFAULT_DRIVE_MODE))
+            away = self._away_state(
+                now, ctx.get("target_setpoint"), ctx.get("outdoor_temp")
+            )
+            # Away wins: while the deep setback is active, the learned
+            # drive signals are forced off (the house is empty regardless
+            # of routine). The suggestion itself is still reported.
+            occupancy_prob = round(learner.predict_occupancy(now), 2)
+            sleeping = learner.is_sleeping(now)
+            wake_window = learner.in_wake_window(now)
+            if away["away_setback_active"]:
+                occupancy_prob = 0.0
+                sleeping = False
+                wake_window = False
+                next_transition = None
+                transition_kind = None
+            return {
+                **defaults,
+                "learned_occupancy_prob": occupancy_prob,
+                "learned_next_arrival": next_transition
+                if transition_kind == "arrival"
+                else None,
+                "learned_next_departure": next_transition
+                if transition_kind == "departure"
+                else None,
+                "learned_wake_time": _next_time_of_day(now, wake_min)
+                if wake_min is not None
+                else None,
+                "learned_bedtime_time": _next_time_of_day(now, bedtime_min)
+                if bedtime_min is not None
+                else None,
+                "learned_schedule_confidence": round(learner.confidence, 2),
+                "learned_schedule_suggestion": learner.suggested_schedule(dtype),
+                "learned_sleeping": sleeping,
+                "learned_wake_window": wake_window,
+                "learned_drive_mode": drive_mode,
+                "heating_rate_f_per_h": self.thermal_learner.heating_rate_f_per_h(outdoor),
+                "cooling_rate_f_per_h": self.thermal_learner.cooling_rate_f_per_h(),
+                "heat_loss_min_per_f": round(
+                    self.thermal_learner.heat_loss_min_per_f(), 2
+                ),
+                "thermal_episodes": self.thermal_learner.episode_count,
+                **away,
+            }
+        except (AttributeError, TypeError, ValueError) as err:
+            _LOGGER.debug("Phase 4 snapshot fell back to defaults: %s", err)
+            return defaults
+
     def _build_preheat_data(self, ctx: Context, pred: Prediction, dec: Decision) -> PreheatData:
         p_res = getattr(self.planner, 'last_pattern_result', None)
+
+        # Fork Phase 4: learned schedule + explicit thermal model (report only).
+        phase4 = self._phase4_snapshot(ctx, pred)
 
         return PreheatData(
             preheat_active=self._preheat_active,
@@ -1762,6 +2335,9 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             detected_modes=p_res.modes_found if p_res else None,
             fallback_used=p_res.fallback_used if p_res else False,
             start_source=dec.get("start_source", "none"),
+            # Fork Phase 4: learned schedule + explicit thermal model (DRIVE mode)
+            # + away mode. The learned signals drive the blueprint.
+            **phase4,
         )
     
 
@@ -1884,6 +2460,13 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                     self.diagnostics.note_model_update(self.physics)
                     await self._async_save_data()
                     _LOGGER.info("Learning Success: Mass=%.1f, Loss=%.1f", self.physics.mass_factor, self.physics.loss_factor)
+
+                # Fork Phase 4: the same warm-up episode feeds the explicit
+                # thermal model (all °C internally; °F only at exposure).
+                if self.thermal_learner.record_episode(
+                    duration, delta_in, outdoor, self.physics.deadtime
+                ):
+                    await self._async_save_data()
         
         self._end_run()
 
@@ -2214,4 +2797,57 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
 
         # Hold state is NOT persisted by design (Vacation mode prevents accidental lock-out on restart)
         # But we trigger an update.
+        await self.async_refresh()
+
+    # -- Fork Phase 4: away mode ------------------------------------------
+
+    async def set_away_mode(self, on: bool) -> None:
+        """Turn away mode on/off (used by the away switch).
+
+        Away overrides the learned schedule: while on, the blueprint
+        holds a deep low-energy setback instead of the routine. Turning
+        away off resumes normal learned drive and, if a return pre-heat
+        was running, stops it. The return datetime is cleared when away
+        is switched off (the trip is over); a stale (past) return is
+        cleared when away is switched on.
+        """
+        self.away_mode = bool(on)
+        now = dt_util.now()
+        if on and self.away_return_dt is not None:
+            # A stale (past) return is cleared when away is switched on.
+            # A timezone-naive value cannot be compared safely; clear it
+            # rather than crash on a naive/aware mismatch.
+            if self.away_return_dt.tzinfo is None:
+                _LOGGER.warning("Away mode: clearing timezone-naive return time")
+                self.away_return_dt = None
+            elif self.away_return_dt <= now:
+                _LOGGER.info("Away mode: clearing stale return time %s", self.away_return_dt)
+                self.away_return_dt = None
+        else:
+            self.away_return_dt = None
+            # Stop any return pre-heat that was running.
+            if self._preheat_active:
+                _LOGGER.info("Away mode off; stopping return pre-heat.")
+                await self.stop_preheat_manual()
+        await self._async_save_data()
+        await self.async_refresh()
+
+    async def set_away_return(self, value: datetime | None) -> None:
+        """Set (or clear) the away return date/time.
+
+        The value is a local timezone-aware datetime; None clears it.
+        The fork then computes a return pre-heat start so the house
+        reaches Comfort by the return time. A return in the past is
+        ignored (cleared).
+        """
+        if value is None:
+            self.away_return_dt = None
+        else:
+            value = dt_util.as_local(value)
+            if value <= dt_util.now():
+                _LOGGER.warning("Away return %s is in the past; ignoring", value)
+                self.away_return_dt = None
+            else:
+                self.away_return_dt = value
+        await self._async_save_data()
         await self.async_refresh()

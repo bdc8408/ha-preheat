@@ -2,7 +2,7 @@
 from typing import Final
 
 DOMAIN: Final = "preheat"
-VERSION = "2.12.2"
+VERSION = "2.14.0-fork.1"
 
 # --- Heating Profiles (V3) ---
 CONF_HEATING_PROFILE: Final = "heating_profile"
@@ -185,6 +185,40 @@ ATTR_ARRIVAL_HISTORY: Final = "arrival_history_v2" # Stores raw timestamps for c
 
 # New Config Keys
 CONF_VALVE_POSITION: Final = "valve_position_sensor"
+
+# Fork Phase 4: optional hallway-motion sensors whose state changes feed
+# sleep/wake learning (binary_sensor entity IDs, e.g. the mmWave
+# occupancy sensors). Empty by default; without them bedtime/wake stay
+# at the fixed-schedule prior with confidence 0.
+CONF_MOTION_SENSORS: Final = "motion_sensors"
+
+# Fork Phase 4 (drive update): the learned schedule DRIVES the blueprint
+# (Ben, Nov 10). drive_mode True = the learned-occupancy / sleeping /
+# wake-window binary sensors are the active schedule source; False =
+# report/suggest only (the fixed schedule helpers stay in charge).
+CONF_DRIVE_MODE: Final = "drive_mode"
+DEFAULT_DRIVE_MODE: Final = True
+
+# Fork Phase 4 (drive update): hallway lights whose "on" counts as
+# hallway activity for the holistic quiet detector (light entity IDs).
+# The hallway lights are motion-driven, so light-on is a second,
+# independent activity signal alongside the motion sensors.
+CONF_HALLWAY_LIGHTS: Final = "hallway_lights"
+
+# Fork Phase 4 (drive update): sustained quiet window in minutes. A
+# bedtime only counts once the house has been quiet (no media, no
+# hallway activity) for this long.
+CONF_QUIET_MINUTES: Final = "quiet_minutes"
+DEFAULT_QUIET_MINUTES: Final = 30
+
+# Fork Phase 4 (away mode, Ben Nov 10): deep setback below the Comfort
+# setpoint while away, in °F. Default 10°F -> away setpoint 61°F (the
+# blueprint's safety floor) at the usual 71°F Comfort.
+CONF_AWAY_OFFSET_F: Final = "away_offset_f"
+DEFAULT_AWAY_OFFSET_F: Final = 10.0
+# Away setpoint never goes below this (°F) — matches the blueprint's
+# safety floor, so the house never drops into a freeze risk.
+AWAY_SETPOINT_FLOOR_F: Final = 61.0
 
 # Physics Defaults
 DEFAULT_MASS_FACTOR: Final = 10.0 # Minutes to raise 1°C (Perfect insulation)

@@ -42,6 +42,14 @@ async def async_setup_entry(
         PreheatNeededBinarySensor(coordinator, entry),
         PreheatBlockedBinarySensor(coordinator, entry),
         PreheatHeatDemandBinarySensor(coordinator, entry),
+        # Fork Phase 4: learned schedule (DRIVE mode — Ben, Nov 10).
+        # These are the blueprint's schedule inputs.
+        PreheatLearnedOccupancyBinarySensor(coordinator, entry),
+        PreheatLearnedSleepingBinarySensor(coordinator, entry),
+        PreheatLearnedWakeWindowBinarySensor(coordinator, entry),
+        # Fork Phase 4: away mode (Ben, Nov 10).
+        PreheatAwayActiveBinarySensor(coordinator, entry),
+        PreheatAwayReturnPreheatBinarySensor(coordinator, entry),
     ]
     
     # Auto-Enable Logic for Existing Installs
@@ -318,6 +326,183 @@ class PreheatHeatDemandBinarySensor(PreheatBaseBinarySensor):
          if data.valve_signal is not None and data.valve_signal >= 15.0: return "valve"
          if delta is not None and delta >= 0.4: return "delta_t"
          return "none"
+
+
+class PreheatLearnedOccupancyBinarySensor(PreheatBaseBinarySensor):
+    """Learned-occupancy signal: is the house *predicted* occupied now?
+
+    From the learned schedule (occupancy history + fixed schedule as
+    prior). DRIVE mode (Ben, Nov 10): the blueprint consumes this in
+    place of the fixed schedule.heating_home inside its
+    binary_sensor.heating_occupied template (OR'd with real presence
+    from binary_sensor.house_occupied, so a work-from-home day still
+    holds Comfort). Forced off while away mode's deep setback is active
+    (away wins over the routine). Until real data outweighs the prior,
+    the signal IS the fixed schedule (prob 1.0 home / 0.0 away in the
+    Leave window), so it is safe as a drive signal from day one.
+    """
+    _attr_translation_key = "learned_occupancy"
+    _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
+    _attr_icon = "mdi:home-account"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_learned_occupancy"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.learned_occupancy_prob >= 0.5
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data
+        attrs: dict[str, Any] = {
+            "probability_percent": round(data.learned_occupancy_prob * 100, 1),
+            "confidence_percent": round(data.learned_schedule_confidence * 100, 1),
+            "drive_mode": data.learned_drive_mode,
+            "source": "learned_schedule",
+        }
+        if data.learned_next_arrival:
+            attrs["next_predicted_arrival"] = data.learned_next_arrival.isoformat()
+        if data.learned_next_departure:
+            attrs["next_predicted_departure"] = data.learned_next_departure.isoformat()
+        return attrs
+
+
+class PreheatLearnedSleepingBinarySensor(PreheatBaseBinarySensor):
+    """Learned-sleep signal: is now inside the learned sleep window?
+
+    On from the learned bedtime to the learned wake time (midnight-
+    crossing aware). DRIVE mode: the blueprint consumes this in place of
+    schedule.heating_sleep as its sleep input. Until real data exists
+    it is the fixed 22:00-05:30 window (the prior). Forced off while
+    away mode's deep setback is active.
+    """
+    _attr_translation_key = "learned_sleeping"
+    _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
+    _attr_icon = "mdi:bed"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_learned_sleeping"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.learned_sleeping
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data
+        attrs: dict[str, Any] = {
+            "drive_mode": data.learned_drive_mode,
+            "source": "learned_schedule",
+        }
+        if data.learned_bedtime_time:
+            attrs["learned_bedtime"] = data.learned_bedtime_time.isoformat()
+        if data.learned_wake_time:
+            attrs["learned_wake"] = data.learned_wake_time.isoformat()
+        return attrs
+
+
+class PreheatLearnedWakeWindowBinarySensor(PreheatBaseBinarySensor):
+    """Learned wake window: is now within 90 min after the learned wake?
+
+    Mirrors the fixed 05:30-07:00 Wake period. DRIVE mode: the blueprint
+    consumes this in place of schedule.heating_wake as its optimal-stop
+    (Wake) input. Until real data exists it is 05:30-07:00 (the prior).
+    Forced off while away mode's deep setback is active.
+    """
+    _attr_translation_key = "learned_wake_window"
+    _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
+    _attr_icon = "mdi:alarm"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_learned_wake_window"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.learned_wake_window
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data
+        attrs: dict[str, Any] = {
+            "drive_mode": data.learned_drive_mode,
+            "source": "learned_schedule",
+        }
+        if data.learned_wake_time:
+            attrs["learned_wake"] = data.learned_wake_time.isoformat()
+        return attrs
+
+
+class PreheatAwayActiveBinarySensor(PreheatBaseBinarySensor):
+    """Away setback phase: away mode is on and the house is in deep setback.
+
+    Off during the return warm-up window (see the away return pre-heat
+    sensor). The blueprint consumes this to hold the away setpoint
+    (sensor.intelligent_preheat_away_setpoint) instead of the routine.
+    """
+    _attr_translation_key = "away_active"
+    _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
+    _attr_icon = "mdi:home-export-outline"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_away_active"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.away_setback_active
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data
+        attrs: dict[str, Any] = {
+            "away_mode": data.away_mode,
+            "source": "away_mode",
+        }
+        if data.away_setpoint is not None:
+            attrs["away_setpoint_f"] = round(
+                data.away_setpoint * 9.0 / 5.0 + 32.0, 1
+            )
+        if data.away_return_dt is not None:
+            attrs["away_return"] = data.away_return_dt.isoformat()
+        return attrs
+
+
+class PreheatAwayReturnPreheatBinarySensor(PreheatBaseBinarySensor):
+    """Away return pre-heat: the house is warming back to Comfort by return.
+
+    On when now is within [return pre-heat start, return time). The
+    blueprint consumes this (OR'd with the normal preheat_active) as its
+    pre_heat_sensor input so the house reaches Comfort by the return
+    time. Off when no return time is set.
+    """
+    _attr_translation_key = "away_return_preheat"
+    _attr_device_class = BinarySensorDeviceClass.RUNNING
+    _attr_icon = "mdi:thermometer-chevron-up"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_away_return_preheat"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.data.away_preheat
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data
+        attrs: dict[str, Any] = {
+            "away_mode": data.away_mode,
+            "source": "away_mode",
+        }
+        if data.away_return_dt is not None:
+            attrs["away_return"] = data.away_return_dt.isoformat()
+        if data.away_return_preheat_start is not None:
+            attrs["return_preheat_start"] = data.away_return_preheat_start.isoformat()
+        return attrs
 
 
 class PreheatHouseIncomingBinarySensor(BinarySensorEntity):
