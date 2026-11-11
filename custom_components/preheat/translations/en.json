@@ -82,7 +82,12 @@
           "occupancy_debounce_minutes": "Occupancy Debounce Time (Minutes)",
           "use_forecast": "Use Weather Forecast",
           "risk_mode": "Forecast Risk Strategy",
-          "physics_mode": "Physics Engine Mode"
+          "physics_mode": "Physics Engine Mode",
+          "drive_mode": "Drive the Blueprint with the Learned Schedule",
+          "motion_sensors": "Hallway Motion Sensors (Sleep/Wake Learning)",
+          "hallway_lights": "Hallway Lights (Quiet Detection)",
+          "quiet_minutes": "Quiet Window for Bedtime (Minutes)",
+          "away_offset_f": "Away Setback Below Comfort (\u00b0F)"
         },
         "data_description": {
           "preheat_lock": "If this entity is ON, preheating is prevented (e.g. Window Contact or Maintenance Switch)."
@@ -201,6 +206,33 @@
       },
       "house_arrival_window": {
         "name": "House Arrival Window"
+      },
+      "learned_occupancy": {
+        "name": "Learned Occupancy Probability"
+      },
+      "learned_wake_time": {
+        "name": "Learned Wake Time"
+      },
+      "learned_bedtime": {
+        "name": "Learned Bedtime"
+      },
+      "learned_heating_rate": {
+        "name": "Learned Heating Rate"
+      },
+      "learned_cooling_rate": {
+        "name": "Learned Cooling Rate"
+      },
+      "learned_deadtime": {
+        "name": "Learned Dead Time"
+      },
+      "learned_heat_loss": {
+        "name": "Learned Heat Loss"
+      },
+      "away_setpoint": {
+        "name": "Away Setpoint"
+      },
+      "away_return_start": {
+        "name": "Away Return Pre-heat Start"
       }
     },
     "switch": {
@@ -212,6 +244,9 @@
       },
       "enabled": {
         "name": "Integration Enabled"
+      },
+      "away_mode": {
+        "name": "Away Mode"
       }
     },
     "button": {
@@ -246,6 +281,26 @@
       },
       "house_incoming": {
         "name": "House Incoming"
+      },
+      "learned_occupancy": {
+        "name": "Learned Occupancy"
+      },
+      "learned_sleeping": {
+        "name": "Learned Sleeping"
+      },
+      "learned_wake_window": {
+        "name": "Learned Wake Window"
+      },
+      "away_active": {
+        "name": "Away Setback Active"
+      },
+      "away_return_preheat": {
+        "name": "Away Return Pre-heat"
+      }
+    },
+    "datetime": {
+      "away_return": {
+        "name": "Away Return Date & Time"
       }
     }
   },
@@ -348,11 +403,11 @@
     },
     "sensor_unit_mismatch": {
       "title": "Sensor Unit Mismatch ({name})",
-      "description": "The configured temperature sensor does not appear to be a Celsius temperature entity (Unit is not '°C' or Device Class is wrong).\n\n**Fix:** Please review the sensor selection in the integration options."
+      "description": "The configured temperature sensor does not appear to be a Celsius temperature entity (Unit is not '\u00b0C' or Device Class is wrong).\n\n**Fix:** Please review the sensor selection in the integration options."
     },
     "sanity_temp": {
       "title": "Implausible Temperature Readings ({name})",
-      "description": "The temperature readings seem unrealistic. Either the Indoor Temperature is extreme (< -10°C / > 45°C), or it tracks the Outdoor Temperature exactly (Swapped Sensors?).\n\n**Fix:** Please verify that Indoor and Outdoor sensors are assigned correctly."
+      "description": "The temperature readings seem unrealistic. Either the Indoor Temperature is extreme (< -10\u00b0C / > 45\u00b0C), or it tracks the Outdoor Temperature exactly (Swapped Sensors?).\n\n**Fix:** Please verify that Indoor and Outdoor sensors are assigned correctly."
     },
     "no_outdoor_source": {
       "title": "No Outdoor Temperature Source ({name})",

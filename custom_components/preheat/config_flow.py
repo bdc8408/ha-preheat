@@ -45,6 +45,15 @@ from .const import (
     CONF_GLOBAL_PRESENCE,
     CONF_ARRIVAL_COMFORT_BIAS,
     CONF_EVENING_COMFORT_WINDOW,
+    # Fork Phase 4 (drive update + away mode, Ben Nov 10).
+    CONF_MOTION_SENSORS,
+    CONF_DRIVE_MODE,
+    DEFAULT_DRIVE_MODE,
+    CONF_HALLWAY_LIGHTS,
+    CONF_QUIET_MINUTES,
+    DEFAULT_QUIET_MINUTES,
+    CONF_AWAY_OFFSET_F,
+    DEFAULT_AWAY_OFFSET_F,
 )
 
 # Centralized Option Definitions (Key -> {selector, default})
@@ -130,6 +139,47 @@ OPTION_SETTINGS = {
     CONF_EVENING_COMFORT_WINDOW: {
         "selector": selector.TextSelector(),
         "default": None
+    },
+    # Fork Phase 4 (drive update, Ben Nov 10): the learned schedule
+    # DRIVES the blueprint's occupancy / sleep / wake inputs. Default
+    # True per Ben's decision; False = report/suggest only.
+    CONF_DRIVE_MODE: {
+        "selector": selector.BooleanSelector(),
+        "default": DEFAULT_DRIVE_MODE
+    },
+    # Fork Phase 4: hallway-motion sensors feeding sleep/wake learning
+    # (binary_sensor entity IDs; multiple).
+    CONF_MOTION_SENSORS: {
+        "selector": selector.EntitySelector(
+            selector.EntitySelectorConfig(domain="binary_sensor", multiple=True)
+        ),
+        "default": None
+    },
+    # Fork Phase 4 (drive update): hallway lights whose "on" counts as
+    # hallway activity for the holistic quiet detector (light entity
+    # IDs; multiple).
+    CONF_HALLWAY_LIGHTS: {
+        "selector": selector.EntitySelector(
+            selector.EntitySelectorConfig(domain="light", multiple=True)
+        ),
+        "default": None
+    },
+    # Fork Phase 4 (drive update): sustained quiet window in minutes
+    # before a bedtime is credible.
+    CONF_QUIET_MINUTES: {
+        "selector": selector.NumberSelector(
+            selector.NumberSelectorConfig(min=5, max=120, step=5, unit_of_measurement="min", mode="box")
+        ),
+        "default": DEFAULT_QUIET_MINUTES
+    },
+    # Fork Phase 4 (away mode, Ben Nov 10): deep setback below Comfort
+    # while away, in °F. Stored as °F (a delta); the coordinator
+    # converts to °C at use via fahrenheit_delta_to_celsius.
+    CONF_AWAY_OFFSET_F: {
+        "selector": selector.NumberSelector(
+            selector.NumberSelectorConfig(min=0, max=20, step=1, unit_of_measurement="°F", mode="box")
+        ),
+        "default": DEFAULT_AWAY_OFFSET_F
     },
 }
 

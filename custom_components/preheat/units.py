@@ -58,6 +58,20 @@ def celsius_to_fahrenheit(value: float) -> float:
     return value * 9.0 / 5.0 + 32.0
 
 
+def celsius_delta_to_fahrenheit(delta_c: float) -> float:
+    """Convert a Celsius *difference* (rate, rise, delta) to Fahrenheit.
+
+    Unlike absolute temperatures, a delta scales by 9/5 with no +32
+    offset: a 1 K/hr heating rate is 1.8 °F/hr.
+    """
+    return delta_c * 9.0 / 5.0
+
+
+def fahrenheit_delta_to_celsius(delta_f: float) -> float:
+    """Convert a Fahrenheit *difference* to Celsius (scales by 5/9, no offset)."""
+    return delta_f * 5.0 / 9.0
+
+
 def to_celsius(value: float, unit: str | None) -> float:
     """Convert ``value`` to Celsius if ``unit`` is Fahrenheit, else pass through."""
     if normalize_unit(unit) == FAHRENHEIT:

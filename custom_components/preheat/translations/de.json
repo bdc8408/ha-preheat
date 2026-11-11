@@ -82,7 +82,12 @@
           "enable_optimal_stop": "Optimal Stop aktivieren (Coasting)",
           "schedule_entity": "Zeitplan-Helfer (Schedule Entity)",
           "stop_tolerance": "Abschalt-Toleranz (K)",
-          "max_coast_hours": "Max. Coasting-Dauer (Stunden)"
+          "max_coast_hours": "Max. Coasting-Dauer (Stunden)",
+          "drive_mode": "Blueprint mit gelerntem Zeitplan steuern",
+          "motion_sensors": "Flur-Bewegungsmelder (Schlaf/Wach-Lernen)",
+          "hallway_lights": "Flurlichter (Ruhe-Erkennung)",
+          "quiet_minutes": "Ruhefenster für Schlafenszeit (Minuten)",
+          "away_offset_f": "Abwesenheits-Absenkung unter Komfort (°F)"
         },
         "data_description": {
           "preheat_lock": "Wenn diese Entit\u00e4t AN/ON ist, wird das Vorheizen blockiert (z.B. Fenster offen oder Wartungsschalter)."
@@ -264,6 +269,33 @@
       },
       "house_arrival_window": {
         "name": "Haus Heimkehr-Fenster"
+      },
+      "learned_occupancy": {
+        "name": "Gelernte Anwesenheits-Wahrscheinlichkeit"
+      },
+      "learned_wake_time": {
+        "name": "Gelernte Aufwachzeit"
+      },
+      "learned_bedtime": {
+        "name": "Gelernte Schlafenszeit"
+      },
+      "learned_heating_rate": {
+        "name": "Gelernte Heizrate"
+      },
+      "learned_cooling_rate": {
+        "name": "Gelernte Abkühlrate"
+      },
+      "learned_deadtime": {
+        "name": "Gelernte Totzeit"
+      },
+      "learned_heat_loss": {
+        "name": "Gelernter Wärmeverlust"
+      },
+      "away_setpoint": {
+        "name": "Abwesenheits-Sollwert"
+      },
+      "away_return_start": {
+        "name": "Start Rückkehr-Vorheizen"
       }
     },
     "binary_sensor": {
@@ -284,6 +316,21 @@
       },
       "house_incoming": {
         "name": "Haus Heimkehr anstehend"
+      },
+      "learned_occupancy": {
+        "name": "Gelernte Anwesenheit"
+      },
+      "learned_sleeping": {
+        "name": "Gelernter Schlaf"
+      },
+      "learned_wake_window": {
+        "name": "Gelerntes Aufwachfenster"
+      },
+      "away_active": {
+        "name": "Abwesenheits-Absenkung aktiv"
+      },
+      "away_return_preheat": {
+        "name": "Rückkehr-Vorheizen"
       }
     },
     "switch": {
@@ -295,6 +342,9 @@
       },
       "enabled": {
         "name": "Integration Aktiviert"
+      },
+      "away_mode": {
+        "name": "Abwesenheitsmodus"
       }
     },
     "button": {
@@ -309,6 +359,11 @@
       },
       "reset_model": {
         "name": "Thermisches Modell zur\u00fccksetzen"
+      }
+    },
+    "datetime": {
+      "away_return": {
+        "name": "Rückkehrdatum und -uhrzeit"
       }
     }
   },

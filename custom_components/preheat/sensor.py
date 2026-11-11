@@ -53,6 +53,17 @@ async def async_setup_entry(
         PreheatTargetTempSensor(coordinator, entry),
         PreheatNextArrivalSensor(coordinator, entry),
         PreheatNextSessionEndSensor(coordinator, entry),
+        # Fork Phase 4: learned schedule + explicit thermal model (DRIVE mode)
+        # + away mode.
+        PreheatLearnedOccupancySensor(coordinator, entry),
+        PreheatLearnedWakeSensor(coordinator, entry),
+        PreheatLearnedBedtimeSensor(coordinator, entry),
+        PreheatLearnedHeatingRateSensor(coordinator, entry),
+        PreheatLearnedCoolingRateSensor(coordinator, entry),
+        PreheatLearnedDeadtimeSensor(coordinator, entry),
+        PreheatLearnedHeatLossSensor(coordinator, entry),
+        PreheatAwaySetpointSensor(coordinator, entry),
+        PreheatAwayReturnStartSensor(coordinator, entry),
     ]
 
     async_add_entities(sensors)
@@ -333,6 +344,294 @@ class PreheatNextSessionEndSensor(PreheatBaseSensor):
         data = self.coordinator.data
         if data.departure_summary:
             attrs["learned_departures"] = data.departure_summary
+        return attrs
+
+
+# --- Fork Phase 4: learned schedule + explicit thermal model (DRIVE mode) ---
+
+
+def _minutes_to_hhmm(minutes: int | None) -> str | None:
+    """Minutes since midnight as "HH:MM" (values >1440 wrap past midnight)."""
+    if minutes is None:
+        return None
+    minutes = minutes % (24 * 60)
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+class PreheatLearnedOccupancySensor(PreheatBaseSensor):
+    """Predicted probability the house is occupied right now (0-100%).
+
+    From the learned schedule (occupancy history + fixed schedule as
+    prior). DRIVE mode (Ben, Nov 10): the companion binary sensor is
+    the blueprint's occupancy input; this is the percentage view.
+    """
+    _attr_translation_key = "learned_occupancy"
+    _attr_entity_registry_enabled_default = False
+    _attr_native_unit_of_measurement = "%"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:home-account"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_learned_occupancy"
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.data.learned_occupancy_prob * 100, 1)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data
+        attrs: dict[str, Any] = {
+            "confidence": round(data.learned_schedule_confidence * 100, 1),
+            "days_of_data": data.learned_schedule_suggestion.get("days_of_data")
+            if data.learned_schedule_suggestion
+            else 0,
+        }
+        if data.learned_next_arrival:
+            attrs["next_predicted_arrival"] = data.learned_next_arrival.isoformat()
+        if data.learned_next_departure:
+            attrs["next_predicted_departure"] = data.learned_next_departure.isoformat()
+        if data.learned_schedule_suggestion:
+            suggestion = data.learned_schedule_suggestion
+            attrs["suggested_wake"] = _minutes_to_hhmm(
+                suggestion["learned"].get("wake_min")
+            )
+            attrs["suggested_bedtime"] = _minutes_to_hhmm(
+                suggestion["learned"].get("bedtime_min")
+            )
+            attrs["suggested_leave"] = _minutes_to_hhmm(
+                suggestion["learned"].get("leave_min")
+            )
+            attrs["suggested_return"] = _minutes_to_hhmm(
+                suggestion["learned"].get("return_min")
+            )
+            attrs["suggestion_delta_minutes"] = suggestion.get("delta_minutes")
+        return attrs
+
+
+class PreheatLearnedWakeSensor(PreheatBaseSensor):
+    """Next predicted wake time from learned sleep/wake patterns."""
+    _attr_translation_key = "learned_wake_time"
+    _attr_entity_registry_enabled_default = False
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:alarm"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_learned_wake_time"
+
+    @property
+    def native_value(self) -> datetime | None:
+        return self.coordinator.data.learned_wake_time
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        suggestion = self.coordinator.data.learned_schedule_suggestion or {}
+        learned = suggestion.get("learned", {})
+        fixed = suggestion.get("fixed", {})
+        return {
+            "median_wake": _minutes_to_hhmm(learned.get("wake_min")),
+            "fixed_wake": _minutes_to_hhmm(fixed.get("wake_min")),
+            "wake_observations": suggestion.get("wake_observations", 0),
+            "confidence": round(
+                self.coordinator.data.learned_schedule_confidence * 100, 1
+            ),
+        }
+
+
+class PreheatLearnedBedtimeSensor(PreheatBaseSensor):
+    """Next predicted bedtime from learned sleep/wake patterns."""
+    _attr_translation_key = "learned_bedtime"
+    _attr_entity_registry_enabled_default = False
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:bed"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_learned_bedtime"
+
+    @property
+    def native_value(self) -> datetime | None:
+        return self.coordinator.data.learned_bedtime_time
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        suggestion = self.coordinator.data.learned_schedule_suggestion or {}
+        learned = suggestion.get("learned", {})
+        fixed = suggestion.get("fixed", {})
+        return {
+            "median_bedtime": _minutes_to_hhmm(learned.get("bedtime_min")),
+            "fixed_bedtime": _minutes_to_hhmm(fixed.get("bedtime_min")),
+            "bedtime_observations": suggestion.get("bedtime_observations", 0),
+            "confidence": round(
+                self.coordinator.data.learned_schedule_confidence * 100, 1
+            ),
+        }
+
+
+class PreheatLearnedHeatingRateSensor(PreheatBaseSensor):
+    """Learned heating rate in °F/hr at the current outdoor temperature.
+
+    Fitted from warm-up episodes (internal math in °C/K, converted at
+    exposure). Unknown until enough episodes exist.
+    """
+    _attr_translation_key = "learned_heating_rate"
+    _attr_entity_registry_enabled_default = False
+    _attr_native_unit_of_measurement = "°F/h"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:thermometer-chevron-up"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_learned_heating_rate"
+
+    @property
+    def native_value(self) -> float | None:
+        value = self.coordinator.data.heating_rate_f_per_h
+        return round(value, 2) if value is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        learner = self.coordinator.thermal_learner
+        return {
+            "rate_at_32f": (
+                round(rate, 2)
+                if (rate := learner.reference_heating_rate_f_per_h()) is not None
+                else None
+            ),
+            "slope_f_per_f": (
+                round(slope, 3)
+                if (slope := learner.rate_slope_f_per_f()) is not None
+                else None
+            ),
+            "episodes": learner.episode_count,
+            "confident": learner.is_confident,
+            "duration_source": self.coordinator.data.thermal_duration_source,
+        }
+
+
+class PreheatLearnedCoolingRateSensor(PreheatBaseSensor):
+    """Learned cooling rate in °F/hr at a 10°F indoor-outdoor delta.
+
+    Derived from the cooling time constant tau.
+    """
+    _attr_translation_key = "learned_cooling_rate"
+    _attr_entity_registry_enabled_default = False
+    _attr_native_unit_of_measurement = "°F/h"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:thermometer-chevron-down"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_learned_cooling_rate"
+
+    @property
+    def native_value(self) -> float | None:
+        value = self.coordinator.data.cooling_rate_f_per_h
+        return round(value, 2) if value is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "cooling_tau_hours": round(self.coordinator.data.coast_tau, 2),
+            "tau_confidence": round(self.coordinator.data.tau_confidence * 100, 1),
+        }
+
+
+class PreheatLearnedDeadtimeSensor(PreheatBaseSensor):
+    """Learned dead time (lag before heat reaches the room), in minutes."""
+    _attr_translation_key = "learned_deadtime"
+    _attr_entity_registry_enabled_default = False
+    _attr_native_unit_of_measurement = "min"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:timer-outline"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_learned_deadtime"
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.data.deadtime, 1)
+
+
+class PreheatLearnedHeatLossSensor(PreheatBaseSensor):
+    """Heat-loss dependence: extra preheat minutes per °F of outdoor delta."""
+    _attr_translation_key = "learned_heat_loss"
+    _attr_entity_registry_enabled_default = False
+    _attr_native_unit_of_measurement = "min/°F"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:home-thermometer-outline"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_learned_heat_loss"
+
+    @property
+    def native_value(self) -> float:
+        return round(self.coordinator.data.heat_loss_min_per_f, 2)
+
+
+class PreheatAwaySetpointSensor(PreheatBaseSensor):
+    """Deep-setback target while away mode is on (native °C, shown °F).
+
+    Comfort minus the away offset (default 10°F), floored at 61°F.
+    Unknown while away mode is off. The blueprint reads this to hold
+    the away setpoint instead of the routine.
+    """
+    _attr_translation_key = "away_setpoint"
+    _attr_entity_registry_enabled_default = False
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:thermometer-low"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_away_setpoint"
+
+    @property
+    def native_value(self) -> float | None:
+        value = self.coordinator.data.away_setpoint
+        return round(value, 2) if value is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data
+        return {
+            "away_mode": data.away_mode,
+            "away_setback_active": data.away_setback_active,
+        }
+
+
+class PreheatAwayReturnStartSensor(PreheatBaseSensor):
+    """When the away return warm-up starts (timestamp).
+
+    Return time minus the predicted warm-up duration (learned thermal
+    model when confident, physics fallback) and the buffer. Unknown
+    while away mode is off or no return time is set. The blueprint's
+    away return pre-heat binary sensor fires from this.
+    """
+    _attr_translation_key = "away_return_start"
+    _attr_entity_registry_enabled_default = False
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:timer-sand"
+
+    @property
+    def unique_id(self) -> str:
+        return f"{self._entry.entry_id}_away_return_start"
+
+    @property
+    def native_value(self) -> datetime | None:
+        return self.coordinator.data.away_return_preheat_start
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data
+        attrs: dict[str, Any] = {"away_mode": data.away_mode}
+        if data.away_return_dt is not None:
+            attrs["away_return"] = data.away_return_dt.isoformat()
         return attrs
 
 
