@@ -220,6 +220,17 @@ DEFAULT_AWAY_OFFSET_F: Final = 10.0
 # safety floor, so the house never drops into a freeze risk.
 AWAY_SETPOINT_FLOOR_F: Final = 61.0
 
+# Fork (feedback listener): Ben's Yes/No notification responses.
+# The notification automations fire `preheat_feedback` with
+# {type: 'home'|'bedtime'|'away', response: 'yes'|'no'}; the fork
+# listens for it and adjusts the learner (a 'no' means the system's
+# call was wrong and must not be reinforced). The feedback log kept
+# in the store is bounded so it cannot grow without limit.
+EVENT_PREHEAT_FEEDBACK: Final = "preheat_feedback"
+FEEDBACK_TYPES: Final = ("home", "bedtime", "away")
+FEEDBACK_RESPONSES: Final = ("yes", "no")
+FEEDBACK_LOG_MAX: Final = 50
+
 # Physics Defaults
 DEFAULT_MASS_FACTOR: Final = 10.0 # Minutes to raise 1°C (Perfect insulation)
 DEFAULT_LOSS_FACTOR: Final = 5.0  # Additional minutes per 1°C of outdoor delta

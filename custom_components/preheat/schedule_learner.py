@@ -170,6 +170,10 @@ class ScheduleLearner:
         # (e.g. motion backfill first, media backfill later) replaces its
         # observation instead of appending a duplicate.
         self._sleep_by_date: dict[str, tuple[int | None, int | None]] = {}
+        # Dates whose bedtime call Ben rejected via a notification
+        # response (see apply_bedtime_feedback). A rejected date's
+        # bedtime is never (re-)derived; its wake is unaffected.
+        self._rejected_bedtimes: set[str] = set()
 
         # In-progress day accumulation (not persisted; a partial day is
         # rebuilt from ticks and dropped on restart).
@@ -342,6 +346,81 @@ class ScheduleLearner:
         for day in sorted(days):
             self._finalise_sleep_for_day(day)
 
+    # -- notification feedback (Ben's Yes/No responses) -----------------
+
+    def _bedtime_feedback_target_date(self, now: datetime) -> str | None:
+        """The night the feedback refers to, from the event time.
+
+        A response sent in the evening (>= 19:00) is about tonight's
+        bedtime call; one sent before 19:00 (after midnight, in the
+        morning, or during the day) is about last night's. The date is
+        derived from the event time, not from the latest observation:
+        repeating the same 'no' must be a no-op, not discard a
+        different night's bedtime.
+        """
+        try:
+            day = now.date()
+            hour = now.hour
+        except AttributeError:
+            return None
+        if not isinstance(day, date) or not isinstance(hour, int):
+            return None
+        if hour >= 19:
+            return day.isoformat()
+        return (day - timedelta(days=1)).isoformat()
+
+    def apply_bedtime_feedback(self, now: datetime, confirmed: bool) -> bool:
+        """Apply a Yes/No response to the latest bedtime call.
+
+        ``confirmed=True`` ('yes'): the derived observation stands —
+        no change. ``confirmed=False`` ('no'): the call was wrong, so
+        the bedtime observation for that date is discarded and the
+        date is marked rejected, so a later finalisation will not
+        re-derive it. The wake observation for the date is unaffected
+        (a wrong bedtime says nothing about the wake). Returns True
+        when the learner state changed.
+        """
+        if confirmed:
+            return False
+        date_key = self._bedtime_feedback_target_date(now)
+        if date_key is None:
+            return False
+        changed = False
+        if date_key not in self._rejected_bedtimes:
+            self._rejected_bedtimes.add(date_key)
+            changed = True
+        obs = self._sleep_by_date.get(date_key)
+        if obs is not None and obs[0] is not None:
+            self._sleep_by_date[date_key] = (None, obs[1])
+            self._rebuild_sleep_observations(day_type_for(date.fromisoformat(date_key)))
+            changed = True
+        return changed
+
+    def apply_occupancy_feedback(self, now: datetime, confirmed: bool) -> bool:
+        """Apply a Yes/No response to the latest home/away call.
+
+        ``confirmed=True`` ('yes'): the call was right — no change.
+        ``confirmed=False`` ('no'): the system's occupancy call was
+        wrong, so the true state is the opposite of what the learner
+        currently predicts for this slot. One correction observation
+        (a day's worth of evidence) is added for the current
+        slot/day-type, down-weighting the wrong call. Returns True
+        when the learner state changed.
+        """
+        if confirmed:
+            return False
+        dtype = _day_type_of(now)
+        minutes = _minutes_since_midnight(now)
+        if dtype is None or minutes is None:
+            return False
+        slot = _slot_index(minutes)
+        thinks_home = self.predict_occupancy(now) >= 0.5
+        actually_home = not thinks_home
+        self._slot_days[dtype][slot] += 1
+        if actually_home:
+            self._slot_occupied[dtype][slot] += 1
+        return True
+
     # -- day finalisation ------------------------------------------------
 
     def finalize_day(self, day: date) -> None:
@@ -411,6 +490,11 @@ class ScheduleLearner:
             if period_end is not None and morning_start <= period_end < morning_end:
                 wake = _to_minutes(period_end)
                 break
+        if day.isoformat() in self._rejected_bedtimes:
+            # Ben rejected this bedtime call via a notification
+            # response: keep the wake (a separate observation) but
+            # never (re-)derive the bedtime for this date.
+            bedtime = None
         if bedtime is None and wake is None:
             return
         self._sleep_by_date[day.isoformat()] = (bedtime, wake)
@@ -625,6 +709,8 @@ class ScheduleLearner:
             },
             # Holistic quiet detector event history (activity + media).
             "quiet": self.quiet_detector.to_dict(),
+            # Bedtime calls Ben rejected via notification feedback.
+            "rejected_bedtimes": sorted(self._rejected_bedtimes)[-90:],
         }
 
     @classmethod
@@ -661,6 +747,11 @@ class ScheduleLearner:
             # Back-compat: old stores kept only the observation lists and
             # the finalised-date set; those load above and _sleep_by_date
             # simply stays empty until new days are finalised.
+            rejected = data.get("rejected_bedtimes")
+            if isinstance(rejected, list):
+                learner._rejected_bedtimes = {
+                    item for item in rejected if isinstance(item, str)
+                }
             quiet = data.get("quiet")
             if isinstance(quiet, dict):
                 learner.quiet_detector = QuietDetector.from_dict(quiet)
