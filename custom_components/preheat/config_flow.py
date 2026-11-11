@@ -10,6 +10,13 @@ from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector, entity_registry as er
 
+from .units import celsius_to_fahrenheit, fahrenheit_to_celsius, hass_uses_fahrenheit
+
+# Comfort Fallback in °F (59–77°F == 15–25°C), shown in the options flow
+# when Home Assistant's unit system is Imperial. The stored value stays °C.
+COMFORT_FALLBACK_F_MIN = 59.0
+COMFORT_FALLBACK_F_MAX = 77.0
+
 from .const import (
     DOMAIN,
     CONF_OCCUPANCY,
@@ -353,6 +360,11 @@ class PreheatingOptionsFlow(config_entries.OptionsFlow):
                              # Remove key if present (Clean Storage)
                              new_options.pop(key, None)
                         else:
+                             # Fork (v2.13.0-fork.1): the Comfort Fallback
+                             # selector is shown in °F on Imperial systems;
+                             # convert back to °C for storage (canonical unit).
+                             if key == CONF_COMFORT_FALLBACK and hass_uses_fahrenheit(self.hass):
+                                 val = round(fahrenheit_to_celsius(float(val)), 1)
                              # Update value
                              new_options[key] = val
                 
@@ -372,18 +384,39 @@ class PreheatingOptionsFlow(config_entries.OptionsFlow):
                 continue
             if not is_system and key in global_keys:
                 continue
-                
-            schema_dict[vol.Optional(key)] = settings["selector"]
-            
+
+            # Fork (v2.13.0-fork.1): on Imperial systems the Comfort
+            # Fallback selector is shown in °F (59–77°F == 15–25°C);
+            # the stored value stays °C.
+            is_fallback_f = (
+                key == CONF_COMFORT_FALLBACK and hass_uses_fahrenheit(self.hass)
+            )
+            if is_fallback_f:
+                schema_dict[vol.Optional(key)] = selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=COMFORT_FALLBACK_F_MIN,
+                        max=COMFORT_FALLBACK_F_MAX,
+                        step=1.0,
+                        unit_of_measurement="°F",
+                        mode="box",
+                    )
+                )
+            else:
+                schema_dict[vol.Optional(key)] = settings["selector"]
+
             # Smart Default handling for suggestions
             default_val = settings["default"]
             if key == CONF_BUFFER_MIN:
                 default_val = profile_data.get("buffer", default_val)
             elif key == CONF_MAX_PREHEAT_HOURS:
                 default_val = profile_data.get("max_duration", default_val)
-            
+
             # Load current value or fallback
             suggestions[key] = self._get_val(key, default_val)
+            if is_fallback_f and suggestions[key] is not None:
+                suggestions[key] = round(
+                    celsius_to_fahrenheit(float(suggestions[key])), 0
+                )
 
         return self.async_show_form(
              step_id="init", 

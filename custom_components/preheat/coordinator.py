@@ -21,6 +21,17 @@ if TYPE_CHECKING:
 
 from .math_preheat import root_find_duration
 from .types import Context, Prediction, Decision
+from .units import (
+    FAHRENHEIT,
+    FAHRENHEIT_SETPOINT_MAX,
+    FAHRENHEIT_SETPOINT_MIN,
+    detect_climate_unit,
+    detect_outdoor_unit,
+    detect_sensor_unit,
+    fahrenheit_to_celsius,
+    hass_temperature_unit,
+    to_celsius,
+)
 
 from .const import (
     DOMAIN,
@@ -311,6 +322,52 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
     def window_open_detected(self) -> bool:
         return self._window_open_detected
 
+    def _ha_temperature_unit(self) -> str | None:
+        """Home Assistant's configured temperature unit, if determinable."""
+        return hass_temperature_unit(self.hass)
+
+    def _migrate_stored_setpoint(self, climate_state=None) -> None:
+        """Convert a persisted comfort setpoint that upstream stored in °F.
+
+        Upstream v2.12.2 saved the raw climate setpoint, so a Fahrenheit
+        thermostat persisted 71 (meaning 71°F) instead of 21.7°C. Convert it
+        once, in place, and log it. Never silently keep it or discard it.
+        Idempotent: after conversion the value is <= 30°C and the range
+        check below returns early on later calls.
+        """
+        stored = self._last_comfort_setpoint
+        if stored is None:
+            return
+        try:
+            value = float(stored)
+        except (TypeError, ValueError):
+            return
+        if not (FAHRENHEIT_SETPOINT_MIN <= value <= FAHRENHEIT_SETPOINT_MAX):
+            return  # Not a plausible Fahrenheit comfort setpoint; leave it.
+        unit = None
+        if climate_state is not None:
+            unit = detect_climate_unit(
+                climate_state.attributes, self._ha_temperature_unit()
+            )
+        else:
+            climate_entity = self._get_conf(CONF_CLIMATE)
+            if climate_entity:
+                state = self.hass.states.get(climate_entity)
+                if state is not None:
+                    unit = detect_climate_unit(
+                        state.attributes, self._ha_temperature_unit()
+                    )
+        if unit == FAHRENHEIT:
+            converted = round(fahrenheit_to_celsius(value), 1)
+            _LOGGER.warning(
+                "[%s] Migrating stored comfort setpoint %.1f°F -> %.1f°C "
+                "(persisted by unit-blind upstream)",
+                self.device_name,
+                value,
+                converted,
+            )
+            self._last_comfort_setpoint = converted
+
     def _get_conf(self, key: str, default: Any = None) -> Any:
         """Get config value from options, falling back to Profile > defaults."""
         options = self.entry.options
@@ -452,6 +509,12 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                      self.diagnostics.load_data(loaded_diag)
                 
                 self._last_comfort_setpoint = data.get("last_comfort_setpoint")
+
+                # Fork (v2.13.0-fork.1): migrate a comfort setpoint
+                # persisted in °F by the unit-blind upstream. Best effort
+                # here; _get_target_setpoint() migrates again before use
+                # if the climate state was not available yet.
+                self._migrate_stored_setpoint()
                 
                 # --- Smart Migration v2.7.1 ---
                 # Check Physics Version
@@ -787,6 +850,9 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             async_delete_issue(self.hass, DOMAIN, f"missing_{issue_id}_{self.entry.entry_id}")
 
     async def _get_operative_temperature(self) -> float:
+        # Fork (v2.13.0-fork.1): every reading is converted to °C at
+        # ingestion. Upstream used the raw number as °C, so a 71°F room
+        # was treated as 71°C. Range checks run AFTER conversion.
         # 1. Primary: Dedicated Sensor (if configured)
         temp_sensor = self._get_conf(CONF_TEMPERATURE)
         if temp_sensor:
@@ -794,9 +860,13 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             if state and state.state not in ("unknown", "unavailable"):
                 try:
                     raw = float(state.state)
-                    if -40 < raw < 80:
+                    unit = detect_sensor_unit(
+                        state.attributes, raw, self._ha_temperature_unit()
+                    )
+                    celsius = to_celsius(raw, unit)
+                    if -40 < celsius < 80:
                         bias = self._get_conf(CONF_AIR_TO_OPER_BIAS, 0.0)
-                        return raw - float(bias)
+                        return celsius - float(bias)
                 except (ValueError, TypeError):
                     pass
 
@@ -807,13 +877,17 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
              if state and state.attributes.get("current_temperature") is not None:
                  try:
                      raw = float(state.attributes["current_temperature"])
-                     if -40 < raw < 80:
-                         # Climate entities typically report Air Temperature. 
+                     unit = detect_climate_unit(
+                         state.attributes, self._ha_temperature_unit()
+                     )
+                     celsius = to_celsius(raw, unit)
+                     if -40 < celsius < 80:
+                         # Climate entities typically report Air Temperature.
                          # No additional bias is applied for now, assuming sensor calibration.
-                         return raw
+                         return celsius
                  except (ValueError, TypeError):
                      pass
-                     
+
         return INVALID_TEMP
 
     async def _get_target_setpoint(self) -> float:
@@ -825,12 +899,25 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         # Check Climate
         climate = self._get_conf(CONF_CLIMATE)
         climate_temp = None
+        climate_state = None
         if climate:
-             state = self.hass.states.get(climate)
+             climate_state = self.hass.states.get(climate)
+             state = climate_state
              if state and state.attributes.get("temperature"):
-                 try: 
-                     climate_temp = float(state.attributes["temperature"])
+                 try:
+                     # Fork (v2.13.0-fork.1): convert to °C at ingestion.
+                     # Upstream used the raw number as °C, so a 71°F
+                     # setpoint was treated as 71°C.
+                     raw = float(state.attributes["temperature"])
+                     unit = detect_climate_unit(
+                         state.attributes, self._ha_temperature_unit()
+                     )
+                     climate_temp = to_celsius(raw, unit)
                  except ValueError: pass
+
+        # Fork (v2.13.0-fork.1): migrate a comfort setpoint persisted in °F
+        # by the unit-blind upstream before it is used or compared below.
+        self._migrate_stored_setpoint(climate_state)
 
         comfort_min = self._get_conf(CONF_COMFORT_MIN, DEFAULT_COMFORT_MIN)
         
@@ -1808,12 +1895,19 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
 
         # 1. Dedicated outdoor sensor takes precedence
         #    (local microclimate beats the coarse regional forecast spot value)
+        #    Fork (v2.13.0-fork.1): convert to °C at ingestion, same unit
+        #    bug class as the indoor readings — a °F sensor or an Imperial
+        #    weather entity would otherwise feed the thermal model raw °F.
         sensor = self._get_conf(CONF_OUTDOOR_TEMP)
         if sensor:
             state = self.hass.states.get(sensor)
             if state and state.state not in ("unavailable", "unknown"):
                 try:
-                    self._cached_outdoor_temp = float(state.state)
+                    raw = float(state.state)
+                    unit = detect_outdoor_unit(
+                        state.attributes, self._ha_temperature_unit()
+                    )
+                    self._cached_outdoor_temp = to_celsius(raw, unit)
                     self._last_weather_check = now
                     self._outdoor_is_real = True
                     self._last_real_outdoor_ts = now
@@ -1830,7 +1924,10 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                 temp = state.attributes.get("temperature")
                 if temp is not None:
                     try:
-                        self._cached_outdoor_temp = float(temp)
+                        unit = detect_outdoor_unit(
+                            state.attributes, self._ha_temperature_unit()
+                        )
+                        self._cached_outdoor_temp = to_celsius(float(temp), unit)
                         self._last_weather_check = now
                         self._outdoor_is_real = True
                         self._last_real_outdoor_ts = now
