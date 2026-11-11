@@ -65,6 +65,12 @@ from .const import (
     CONF_AWAY_OFFSET_F,
     DEFAULT_AWAY_OFFSET_F,
     AWAY_SETPOINT_FLOOR_F,
+    # Fork (feedback listener): Ben's Yes/No notification responses
+    # arrive as `preheat_feedback` events; see _handle_feedback.
+    EVENT_PREHEAT_FEEDBACK,
+    FEEDBACK_TYPES,
+    FEEDBACK_RESPONSES,
+    FEEDBACK_LOG_MAX,
     CONF_DEBOUNCE_MIN,
     CONF_PHYSICS_MODE,
     PHYSICS_STANDARD,
@@ -291,6 +297,14 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         # not silently cancel it and heat an empty house.
         self.away_mode: bool = False
         self.away_return_dt: datetime | None = None
+        # Fork (feedback listener): whether the current away period was
+        # rejected by Ben's notification response ('no' to an away-mode
+        # alert). A rejected away period is not a learning episode.
+        # Reset whenever away mode is toggled (a new trip starts).
+        self._away_rejected: bool = False
+        # Fork (feedback listener): bounded log of Ben's Yes/No
+        # notification responses, persisted for auditability.
+        self._feedback_log: list[dict] = []
         self.session_resolver = None
         self._last_cooling_analysis = None
         self.tau_revalidated = False
@@ -669,6 +683,16 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             # Fork Phase 4: away mode (persisted; a restart must not
             # silently cancel a trip and heat an empty house).
             self.away_mode = bool(data.get("away_mode", False))
+            # Fork (feedback listener): whether the current away period
+            # was rejected by Ben, plus the bounded feedback log.
+            self._away_rejected = bool(data.get("away_rejected", False))
+            feedback_log = data.get("feedback_log")
+            if isinstance(feedback_log, list):
+                self._feedback_log = [
+                    entry for entry in feedback_log if isinstance(entry, dict)
+                ][-FEEDBACK_LOG_MAX:]
+            else:
+                self._feedback_log = []
             away_return = data.get("away_return")
             self.away_return_dt = None
             if isinstance(away_return, str):
@@ -740,6 +764,10 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             # Fork Phase 4: away mode (persisted across restarts).
             "away_mode": self.away_mode,
             "away_return": self.away_return_dt.isoformat() if self.away_return_dt else None,
+            # Fork (feedback listener): whether the current away period
+            # was rejected, and the bounded Yes/No feedback log.
+            "away_rejected": self._away_rejected,
+            "feedback_log": self._feedback_log[-FEEDBACK_LOG_MAX:],
         }
 
     async def _async_save_data(self) -> None:
@@ -763,6 +791,9 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                 # Fork Phase 4: away mode is non-thermal state; keep it too.
                 stored_data["away_mode"] = self.away_mode
                 stored_data["away_return"] = self.away_return_dt.isoformat() if self.away_return_dt else None
+                # Fork (feedback listener): keep the rejection flag and log.
+                stored_data["away_rejected"] = self._away_rejected
+                stored_data["feedback_log"] = self._feedback_log[-FEEDBACK_LOG_MAX:]
                 
                 await self._store.async_save(stored_data)
                 return
@@ -1040,6 +1071,17 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             )
         self._seed_quiet_state()
 
+        # Fork (feedback listener): Ben's Yes/No responses to the
+        # learned-schedule notifications. The notification automations
+        # fire `preheat_feedback` with {type: 'home'|'bedtime'|'away',
+        # response: 'yes'|'no'}; _handle_feedback validates the event
+        # and adjusts the learner. Malformed events are ignored and
+        # the handler never raises, so feedback can never break the
+        # update cycle or the event bus.
+        self.entry.async_on_unload(
+            self.hass.bus.async_listen(EVENT_PREHEAT_FEEDBACK, self._handle_feedback)
+        )
+
         # 2. Climate & Temperature (Reactive Setpoints / Frost Protection - Action 3.3)
         # We want to react immediately if the user changes the setpoint manually on the TRV
         # or if the room temperature drops (Frost Protection).
@@ -1128,7 +1170,94 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         except Exception as err:
             _LOGGER.debug("Quiet seeding (lights) skipped: %s", err)
 
-    @callback
+    # Plain method (not @callback): the test harness stubs
+    # homeassistant.core.callback with a MagicMock, which would
+    # replace a decorated handler and make it untestable. A plain
+    # sync method is called identically by hass.bus.async_listen.
+    def _handle_feedback(self, event) -> None:
+        """Ben's Yes/No response to a learned-schedule notification.
+
+        The notification automations fire ``preheat_feedback`` with
+        data ``{type: 'home'|'bedtime'|'away', response: 'yes'|'no'}``.
+        A 'yes' confirms the system's call (the observation stands);
+        a 'no' means the call was wrong and the learner must not
+        reinforce it:
+          * bedtime 'no' — discard that date's bedtime observation
+            (the quiet detector may have called it too early).
+          * home 'no' — the occupancy call was wrong; add one
+            correction observation for the current slot, with the
+            true state being the opposite of the system's call.
+          * away 'no' — the away period was a false alarm; mark it
+            rejected so it is never treated as a learning episode
+            (occupancy ticks are never fed while away mode is on).
+        Unknown or malformed events are ignored. Never raises.
+        """
+        try:
+            data = getattr(event, "data", None)
+            if not isinstance(data, dict):
+                _LOGGER.debug("preheat_feedback: ignoring event without data")
+                return
+            fb_type = data.get("type")
+            response = data.get("response")
+            if not isinstance(fb_type, str) or not isinstance(response, str):
+                _LOGGER.debug("preheat_feedback: ignoring malformed event: %r", data)
+                return
+            fb_type = fb_type.strip().lower()
+            response = response.strip().lower()
+            if fb_type not in FEEDBACK_TYPES or response not in FEEDBACK_RESPONSES:
+                _LOGGER.debug(
+                    "preheat_feedback: ignoring unknown type/response: %r", data
+                )
+                return
+            confirmed = response == "yes"
+            now = dt_util.as_local(dt_util.now())
+            changed = False
+            if fb_type == "bedtime":
+                changed = self.schedule_learner.apply_bedtime_feedback(now, confirmed)
+            elif fb_type == "home":
+                changed = self.schedule_learner.apply_occupancy_feedback(now, confirmed)
+            elif fb_type == "away":
+                if not confirmed:
+                    self._away_rejected = True
+                    changed = True
+            self._record_feedback(fb_type, response, changed, now)
+            _LOGGER.info(
+                "preheat_feedback: %s=%s (learner changed: %s)",
+                fb_type,
+                response,
+                changed,
+            )
+            self.hass.async_create_task(self._async_save_data())
+        except Exception as err:  # never break the bus on a feedback error
+            _LOGGER.warning("preheat_feedback: handler failed: %s", err)
+
+    def _record_occupancy_tick(self, now: datetime, is_occupied: bool) -> None:
+        """One occupancy observation per cycle for the schedule learner.
+
+        Away periods are exceptions, not routine: while away mode is
+        on, no ticks are fed, so a multi-day trip never teaches the
+        routine learner that the house is empty — and a rejected
+        (false-alarm) away period can never become a learning episode
+        at all.
+        """
+        if self.away_mode:
+            return
+        self.schedule_learner.record_tick(now, is_occupied)
+
+    def _record_feedback(
+        self, fb_type: str, response: str, changed: bool, now: datetime | None
+    ) -> None:
+        """Append one feedback event to the bounded, persisted log."""
+        try:
+            at_iso = now.isoformat() if isinstance(now, datetime) else str(now)
+        except Exception:
+            at_iso = "unknown"
+        self._feedback_log.append(
+            {"type": fb_type, "response": response, "changed": bool(changed), "at": at_iso}
+        )
+        if len(self._feedback_log) > FEEDBACK_LOG_MAX:
+            self._feedback_log = self._feedback_log[-FEEDBACK_LOG_MAX:]
+
     def _handle_occupancy_change(self, event) -> None:
         new_state = event.data.get("new_state")
         old_state = event.data.get("old_state")
@@ -1477,7 +1606,7 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
 
         # Fork Phase 4: one occupancy observation per cycle for the
         # schedule learner, and refresh the explicit thermal model.
-        self.schedule_learner.record_tick(now, is_occupied)
+        self._record_occupancy_tick(now, is_occupied)
         self._sync_thermal_learner()
             
         # Window (Attribute based or internal status)
@@ -2812,6 +2941,9 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         cleared when away is switched on.
         """
         self.away_mode = bool(on)
+        # A mode change starts a fresh away period: clear any
+        # rejection recorded for the previous trip (see _handle_feedback).
+        self._away_rejected = False
         now = dt_util.now()
         if on and self.away_return_dt is not None:
             # A stale (past) return is cleared when away is switched on.
