@@ -530,6 +530,18 @@ class ScheduleLearner:
             return minutes >= bed or minutes < wak
         return bed <= minutes < wak
 
+    def is_awake(self, dt: datetime) -> bool:
+        """True when the house is demonstrably awake right now.
+
+        Sustained hallway activity / media after a quiet night (see
+        ``QuietDetector.awake_since``). A brief night burst does not
+        count, so a water trip cannot wake the house. The coordinator
+        uses this to end the learned sleep window early: the clock
+        alone kept the house "asleep" until the learned wake time even
+        when Ben was up and moving (Nov 14 2026).
+        """
+        return self.quiet_detector.awake_since(dt) is not None
+
     def in_wake_window(self, dt: datetime, window_minutes: int = WAKE_WINDOW_MINUTES) -> bool:
         """True when ``dt`` is inside the learned wake window.
 

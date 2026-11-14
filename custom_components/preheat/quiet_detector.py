@@ -37,6 +37,15 @@ DEFAULT_QUIET_MINUTES = 30
 # prevents the merge — the house was genuinely awake.
 MERGE_GAP_MINUTES = 15
 
+# Sustained activity needed to count as awake (live wake-up, Nov 14
+# 2026): a water trip is ~2 min of motion; a morning routine is
+# repeated motion over 10+ minutes. See awake_since().
+AWAKE_SUSTAIN_MINUTES = 10
+
+# Lookback for the live wake-up check: the night's quiet period
+# started ~12 h ago; a full day covers it with margin.
+AWAKE_LOOKBACK_HOURS = 24
+
 # Activity / media events are capped (enough for ~2 months of events).
 MAX_EVENTS = 4000
 
@@ -91,6 +100,50 @@ class QuietDetector:
 
     # -- queries ----------------------------------------------------------
 
+    def _noise_intervals(
+        self, start_n: datetime, end_n: datetime
+    ) -> list[tuple[datetime, datetime, bool]]:
+        """Merged noise intervals in [start_n, end_n].
+
+        Activity instants are points; media-on spans are intervals (a
+        span still playing at ``end_n`` is clipped to it). Overlapping
+        intervals merge (a motion point inside a media span, overlapping
+        media spans, ...). Shared by quiet_periods() and awake_since().
+        """
+        noise: list[tuple[datetime, datetime, bool]] = []
+        for event in self._activity:
+            if start_n <= event <= end_n:
+                noise.append((event, event, False))
+        media_on: datetime | None = None
+        for event_dt, playing in self._media:
+            if playing and media_on is None:
+                media_on = event_dt
+            elif not playing and media_on is not None:
+                interval_start, interval_end = media_on, event_dt
+                media_on = None
+                if interval_end > start_n and interval_start < end_n:
+                    noise.append(
+                        (max(interval_start, start_n), min(interval_end, end_n), True)
+                    )
+        if media_on is not None and media_on < end_n:
+            noise.append((max(media_on, start_n), end_n, True))
+
+        if not noise:
+            return []
+        noise.sort(key=lambda item: item[0])
+        merged: list[tuple[datetime, datetime, bool]] = []
+        for item_start, item_end, is_media in noise:
+            if merged and item_start <= merged[-1][1]:
+                prev_start, prev_end, prev_media = merged[-1]
+                merged[-1] = (
+                    prev_start,
+                    max(prev_end, item_end),
+                    prev_media or is_media,
+                )
+            else:
+                merged.append((item_start, item_end, is_media))
+        return merged
+
     def media_playing_at(self, dt: datetime) -> bool:
         """Whether any media was playing at ``dt`` (False if unknown)."""
         naive = _naive(dt)
@@ -138,6 +191,62 @@ class QuietDetector:
             break
         return last_noise
 
+    def awake_since(
+        self, now: datetime, sustain_minutes: int = AWAKE_SUSTAIN_MINUTES
+    ) -> datetime | None:
+        """Start of the current sustained-awake stretch, or None.
+
+        Live wake-up (fork, Nov 14 2026): the learned sleep window is a
+        clock (learned bedtime -> learned wake), so on Nov 14 the house
+        stayed "asleep" until the learned 09:04 wake even though Ben was
+        up and moving from 07:54. The coordinator clears the sleeping
+        signal when this returns a time.
+
+        A stretch starts at the first noise (hallway activity or media
+        starting) after a quiet period of at least ``quiet_minutes``.
+        It counts as awake only once the noise has lasted
+        ``sustain_minutes`` — a 2-minute water trip never reaches it,
+        and a burst that ends before the threshold never counts, even
+        after 10 quiet minutes have passed since. Once awake, the
+        stretch stays awake until the house has gone quiet for
+        ``quiet_minutes`` again, so sitting still after the morning
+        routine does not flip the house back to sleep after a few
+        quiet minutes. Media playing counts as awake, as it does for
+        bedtime; a TV left playing all night therefore keeps the house
+        awake (a warmer night, not a cold one).
+
+        Returns the naive-local start of the stretch, or None when the
+        house is currently quiet, has no preceding quiet period, or the
+        current noise has not sustained long enough.
+        """
+        naive = _naive(now)
+        if naive is None:
+            return None
+        window_start = naive - timedelta(hours=AWAKE_LOOKBACK_HOURS)
+        merged = self._noise_intervals(window_start, naive)
+        if not merged:
+            return None
+        # Last completed quiet period (gap >= quiet_minutes) before now;
+        # its end is the first noise of the current stretch.
+        cursor = window_start
+        last_quiet_end: datetime | None = None
+        for noise_start, noise_end, _ in merged:
+            if noise_start > cursor:
+                if (noise_start - cursor).total_seconds() / 60.0 >= self.quiet_minutes:
+                    last_quiet_end = noise_start
+            cursor = max(cursor, noise_end)
+        # Trailing gap: the house has gone quiet again -> stretch over.
+        if (naive - cursor).total_seconds() / 60.0 >= self.quiet_minutes:
+            return None
+        if last_quiet_end is None:
+            return None
+        # Latest noise at or before now; a media span still playing at
+        # ``now`` was clipped to the window end, so it reads as now.
+        last_noise = max(noise_end for _, noise_end, _ in merged)
+        if (last_noise - last_quiet_end).total_seconds() / 60.0 >= sustain_minutes:
+            return last_quiet_end
+        return None
+
     def has_data(self, start: datetime, end: datetime) -> bool:
         """Any activity or media event in [start, end] (i.e. signal, not silence)."""
         start_n, end_n = _naive(start), _naive(end)
@@ -167,45 +276,12 @@ class QuietDetector:
         if start_n is None or end_n is None or end_n <= start_n:
             return []
 
-        # Noise intervals in the window: activity points + media-on spans.
-        noise: list[tuple[datetime, datetime, bool]] = []  # (start, end, is_media)
-        for event in self._activity:
-            if start_n <= event <= end_n:
-                noise.append((event, event, False))
-        media_on: datetime | None = None
-        for event_dt, playing in self._media:
-            if playing and media_on is None:
-                media_on = event_dt
-            elif not playing and media_on is not None:
-                interval_start, interval_end = media_on, event_dt
-                media_on = None
-                if interval_end > start_n and interval_start < end_n:
-                    noise.append(
-                        (max(interval_start, start_n), min(interval_end, end_n), True)
-                    )
-        if media_on is not None and media_on < end_n:
-            noise.append((max(media_on, start_n), end_n, True))
-
-        if not noise:
+        merged = self._noise_intervals(start_n, end_n)
+        if not merged:
             # No noise at all in the window: one long quiet period.
             if (end_n - start_n).total_seconds() / 60.0 >= self.quiet_minutes:
                 return [(start_n, None)]
             return []
-
-        # Merge overlapping noise intervals (a point inside a media span,
-        # overlapping media spans, ...).
-        noise.sort(key=lambda item: item[0])
-        merged: list[tuple[datetime, datetime, bool]] = []
-        for item_start, item_end, is_media in noise:
-            if merged and item_start <= merged[-1][1]:
-                prev_start, prev_end, prev_media = merged[-1]
-                merged[-1] = (
-                    prev_start,
-                    max(prev_end, item_end),
-                    prev_media or is_media,
-                )
-            else:
-                merged.append((item_start, item_end, is_media))
 
         # Gaps between merged noise intervals are quiet candidates.
         periods: list[tuple[datetime, datetime | None]] = []
