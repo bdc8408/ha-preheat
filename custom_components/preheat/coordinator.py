@@ -2382,6 +2382,14 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             # of routine). The suggestion itself is still reported.
             occupancy_prob = round(learner.predict_occupancy(now), 2)
             sleeping = learner.is_sleeping(now)
+            # Live wake-up (fork, Nov 14 2026): sustained morning
+            # activity ends the sleep window early. The clock alone
+            # kept the house "asleep" long after Ben was up — Nov 14:
+            # hallway motion 07:54-08:09, learned wake 09:04, sleeping
+            # stuck on until the clock said so. A brief night burst
+            # never sustains, so a water trip cannot wake the house.
+            if sleeping and learner.is_awake(now):
+                sleeping = False
             wake_window = learner.in_wake_window(now)
             if away["away_setback_active"]:
                 occupancy_prob = 0.0

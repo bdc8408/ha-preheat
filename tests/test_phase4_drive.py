@@ -17,6 +17,7 @@ import pytest
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from custom_components.preheat.schedule_learner import ScheduleLearner
+from custom_components.preheat.quiet_detector import QuietDetector
 from custom_components.preheat.thermal_learner import ThermalLearner
 from custom_components.preheat.units import fahrenheit_to_celsius
 from custom_components.preheat.const import (
@@ -181,6 +182,89 @@ def test_quiet_detector_persistence_round_trip():
 
 
 # ---------------------------------------------------------------------------
+# Live wake-up: sustained morning activity ends the sleep window early
+# (fork, Nov 14 2026 — Ben was up and moving 07:54-08:09, learned wake
+# 09:04, but learned_sleeping stayed on until the clock said so).
+# ---------------------------------------------------------------------------
+
+def _nov14_detector() -> tuple[QuietDetector, datetime]:
+    """Detector fed the Nov 13 night + Nov 14 morning (Ben's actual day).
+
+    Last night motion 21:55; morning motion 07:54:07, 07:54:32,
+    07:55:06, 07:56:03, 07:57:22, 08:05:54, 08:06:25, 08:09:19.
+    Returns (detector, morning base = Nov 14 00:00).
+    """
+    detector = QuietDetector()
+    night = datetime(2026, 11, 13, 21, 55)
+    detector.record_activity(night)
+    morning = datetime(2026, 11, 14, 7, 54, 7)
+    for minutes, seconds in [(0, 0), (0, 25), (0, 59), (1, 56), (3, 15),
+                             (11, 47), (12, 18), (15, 12)]:
+        detector.record_activity(morning + timedelta(minutes=minutes, seconds=seconds))
+    return detector, datetime(2026, 11, 14)
+
+
+def test_awake_since_none_when_quiet():
+    """A quiet house (no morning noise at all) is never awake."""
+    detector = QuietDetector()
+    detector.record_activity(datetime(2026, 11, 13, 21, 55))
+    assert detector.awake_since(datetime(2026, 11, 14, 8, 0)) is None
+    assert detector.awake_since(datetime(2026, 11, 14, 9, 30)) is None
+
+
+def test_awake_since_ignores_water_trip():
+    """A 01:00-01:02 water trip never sustains long enough to wake."""
+    detector = QuietDetector()
+    detector.record_activity(datetime(2026, 11, 13, 21, 55))
+    detector.record_activity(datetime(2026, 11, 14, 1, 0))
+    detector.record_activity(datetime(2026, 11, 14, 1, 2))
+    assert detector.awake_since(datetime(2026, 11, 14, 1, 10)) is None
+    assert detector.awake_since(datetime(2026, 11, 14, 1, 40)) is None
+
+
+def test_awake_since_after_sustained_morning_activity():
+    """Nov 14 replay: awake at ~08:06, still awake at 08:20, quiet again by 08:40."""
+    detector, _ = _nov14_detector()
+    # 08:00: only ~3 min of activity so far — not sustained yet.
+    assert detector.awake_since(datetime(2026, 11, 14, 8, 0)) is None
+    # 08:06: 11+ min of repeated motion — awake since the first move.
+    assert detector.awake_since(datetime(2026, 11, 14, 8, 6)) == datetime(
+        2026, 11, 14, 7, 54, 7
+    )
+    # 08:20: 11 min after the last motion, still inside the 30-min latch.
+    assert detector.awake_since(datetime(2026, 11, 14, 8, 20)) == datetime(
+        2026, 11, 14, 7, 54, 7
+    )
+    # 08:40: 31 min after the last motion — the house is quiet again.
+    assert detector.awake_since(datetime(2026, 11, 14, 8, 40)) is None
+
+
+def test_awake_since_single_blip_never_counts():
+    """One motion event, then nothing: no stretch, never awake."""
+    detector = QuietDetector()
+    detector.record_activity(datetime(2026, 11, 13, 21, 55))
+    detector.record_activity(datetime(2026, 11, 14, 7, 54))
+    assert detector.awake_since(datetime(2026, 11, 14, 8, 0)) is None
+    assert detector.awake_since(datetime(2026, 11, 14, 8, 30)) is None
+
+
+def test_awake_since_media_sustained():
+    """Media playing for 10+ min counts as awake; a 5-min burst does not."""
+    detector = QuietDetector()
+    detector.record_activity(datetime(2026, 11, 13, 22, 0))
+    detector.record_media(datetime(2026, 11, 14, 7, 0), True)
+    assert detector.awake_since(datetime(2026, 11, 14, 7, 30)) == datetime(
+        2026, 11, 14, 7, 0
+    )
+
+    control = QuietDetector()
+    control.record_activity(datetime(2026, 11, 13, 22, 0))
+    control.record_media(datetime(2026, 11, 14, 7, 0), True)
+    control.record_media(datetime(2026, 11, 14, 7, 5), False)
+    assert control.awake_since(datetime(2026, 11, 14, 7, 15)) is None
+
+
+# ---------------------------------------------------------------------------
 # Coordinator wiring: drive + away mode
 # ---------------------------------------------------------------------------
 
@@ -282,6 +366,38 @@ class TestPhase4DriveCoordinator(unittest.IsolatedAsyncioTestCase):
         snap = self._snapshot(datetime(2026, 11, 16, 6, 30))
         assert snap["learned_sleeping"] is False
         assert snap["learned_wake_window"] is True
+
+    def test_live_wake_up_ends_sleep_early(self):
+        """Nov 14 replay: learned wake ~09:00, but sustained 07:54-08:09
+        motion wakes the house at ~08:06; without it, sleeping holds."""
+        # 7 workdays whose first morning motion is ~09:00.
+        events = []
+        for day in workdays(date(2026, 11, 2), 7):
+            base = datetime.combine(day, datetime.min.time())
+            events.append(base + timedelta(minutes=22 * 60 + 15))  # bedtime
+            events.append(base + timedelta(minutes=9 * 60))        # 09:00
+            events.append(base + timedelta(minutes=9 * 60 + 10))   # 09:10
+        self.coord.schedule_learner.ingest_motion_history(sorted(events))
+        wake, _, wake_n = self.coord.schedule_learner.learned_wake("workday")
+        assert wake_n == 7 and 8 * 60 + 55 <= wake <= 9 * 60 + 5
+        # Monday Nov 16, 08:00: the clock says sleeping, no live motion yet.
+        snap = self._snapshot(datetime(2026, 11, 16, 8, 0))
+        assert snap["learned_sleeping"] is True
+        assert snap["learned_wake_window"] is False
+        # Sustained morning motion (the Nov 14 pattern, replayed Nov 16).
+        morning = datetime(2026, 11, 16, 7, 54, 7)
+        for minutes, seconds in [(0, 0), (0, 25), (0, 59), (1, 56), (3, 15),
+                                 (11, 47), (12, 18)]:
+            self.coord.schedule_learner.record_motion(
+                morning + timedelta(minutes=minutes, seconds=seconds)
+            )
+        snap = self._snapshot(datetime(2026, 11, 16, 8, 6))
+        assert snap["learned_sleeping"] is False
+        # Control: the same morning without the motion still sleeps.
+        control = ScheduleLearner()
+        control.ingest_motion_history(sorted(events))
+        assert control.is_sleeping(datetime(2026, 11, 16, 8, 6)) is True
+        assert control.is_awake(datetime(2026, 11, 16, 8, 6)) is False
 
     def test_drive_mode_off_reports_suggest_only(self):
         self.coord.entry.options[CONF_DRIVE_MODE] = False
