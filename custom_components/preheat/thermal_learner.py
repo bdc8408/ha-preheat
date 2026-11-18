@@ -88,6 +88,11 @@ class ThermalLearner:
         self._sum_xy = 0.0
         # Recent episodes for diagnostics: (outdoor_c, rate_k_per_h).
         self._recent_episodes: list[tuple[float, float]] = []
+        # Why the most recent record_episode call was rejected
+        # ("rise" | "deadtime" | "rate" | "invalid"), or None when it
+        # was accepted. Read by the coordinator to count rejection
+        # reasons for the backfill summary.
+        self.last_reject_reason: str | None = None
         # Synced from the physics model / cooling analyzer (coordinator).
         self.deadtime_min = 0.0
         self.loss_factor_min_per_k = 0.0
@@ -108,20 +113,31 @@ class ThermalLearner:
         ``duration_min`` is the full heat-up time (start until the target
         was reached); the dead time is subtracted because the house does
         not warm during it. All temperatures in °C/K.
+
+        ``deadtime_min`` must be a MEASURED dead time. Pass 0.0 when
+        no measurement exists: 0.0 means "unmeasured", not "measured
+        zero" (the analyzer never reports 0), so a 0.0 here must not
+        overwrite the synced profile prior in ``deadtime_min`` — the
+        prediction path keeps using the profile deadtime until the
+        analyzer measures a real one.
         """
         duration_min = _coerce_float(duration_min)
         delta_t_in_c = _coerce_float(delta_t_in_c)
         outdoor_c = _coerce_float(outdoor_c)
         deadtime_min = _coerce_float(deadtime_min, 0.0)
+        self.last_reject_reason = None
         if duration_min is None or delta_t_in_c is None or outdoor_c is None:
+            self.last_reject_reason = "invalid"
             return False
         if delta_t_in_c < MIN_DELTA_K:
+            self.last_reject_reason = "rise"
             _LOGGER.debug(
                 "ThermalLearner: skipping episode, rise %.2f K too small", delta_t_in_c
             )
             return False
         effective_min = duration_min - deadtime_min
         if effective_min <= 5.0:
+            self.last_reject_reason = "deadtime"
             _LOGGER.debug(
                 "ThermalLearner: skipping episode, effective heat-up %.1f min too short",
                 effective_min,
@@ -129,10 +145,13 @@ class ThermalLearner:
             return False
         # The episode's deadtime is the physics deadtime in effect for the
         # run; retain the latest so duration prediction works even before
-        # the coordinator's next sync.
-        self.deadtime_min = deadtime_min
+        # the coordinator's next sync. A 0.0 (unmeasured) is not a
+        # measurement: it must not clobber the synced profile prior.
+        if deadtime_min > 0:
+            self.deadtime_min = deadtime_min
         rate = delta_t_in_c / (effective_min / 60.0)  # K/hr
         if not (MIN_RATE_K_PER_H <= rate <= MAX_RATE_K_PER_H):
+            self.last_reject_reason = "rate"
             _LOGGER.debug(
                 "ThermalLearner: rejecting implausible rate %.2f K/hr", rate
             )

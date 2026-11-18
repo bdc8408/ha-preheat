@@ -144,6 +144,25 @@ class TestPhysics(unittest.TestCase):
         self.assertEqual(p.avg_error, 0.0)
         self.assertEqual(p.deadtime, 0.0)
 
+    def test_deadtime_measured_flag(self):
+        """Phase 8 Fix 1: the deadtime is unmeasured until the
+        analyzer reports one. A profile default loaded for a 0.0
+        stored deadtime is a prior, not a measurement; update_deadtime
+        marks it measured; reset clears it; to_dict round-trips it."""
+        profile = HEATING_PROFILES[PROFILE_RADIATOR_NEW]
+        p = ThermalPhysics(data=None, profile_data=profile)
+        self.assertEqual(p.deadtime, 15.0)
+        self.assertIs(p.deadtime_measured, False)
+        p.update_deadtime(12.0)
+        self.assertIs(p.deadtime_measured, True)
+        restored = ThermalPhysics(
+            data=ThermalModelData(**p.to_dict()), profile_data=profile
+        )
+        self.assertIs(restored.deadtime_measured, True)
+        restored.reset(profile)
+        self.assertIs(restored.deadtime_measured, False)
+        self.assertEqual(restored.deadtime, 15.0)
+
     def test_profile_constraints_clamping(self):
         """Verify V3 Profile constraints."""
         profile = HEATING_PROFILES[PROFILE_RADIATOR_NEW]

@@ -21,6 +21,22 @@ Covered here:
   guard (sample_count stays 0) while the learner accumulates episodes;
 - the no-outdoor skip (Fix D): a session with no outdoor coverage is
   skipped, never fed with the fabricated 10.0 C placeholder.
+
+Phase 8 (v2.14.4): the v2.14.3 backfill ran live but fed only 1 of
+164 sessions — the Radiator profile's 15-min deadtime (never
+measured, only a profile prior) was subtracted from 5-13 min cycles
+and inflated longer legs past the rate cap, and sessions were
+shredded by 1°F setpoint steps. Covered here:
+- Fix 1: an unmeasured deadtime is passed as 0.0, so the effective
+  duration is the full duration; a measured deadtime is still
+  subtracted (and the learner keeps the synced profile prior when
+  fed 0.0, so prediction is untouched).
+- Fix 2: a setpoint step UP mid-warm-up retargets the session
+  instead of closing it (a step DOWN still closes it); the backfill
+  grace is 15 min, so a furnace cycle mid-warm-up does not split it.
+- Fix 3: a versioned re-run — a v2.14.3 store (flag set, no version)
+  re-runs once after the reset, and the same version never re-runs.
+- Fix 4: the backfill summary logs at WARNING with rejection counts.
 """
 import sys
 import os
@@ -39,6 +55,7 @@ from custom_components.preheat.const import (
     TARGET_REACHED_TOLERANCE,
 )
 from custom_components.preheat.coordinator import (
+    BACKFILL_VERSION,
     PASSIVE_NON_HEATING_GRACE_MIN,
     PASSIVE_SETPOINT_CHANGE_K,
 )
@@ -162,9 +179,11 @@ class TestReconstructSessions(unittest.TestCase):
         ])
         assert sessions == []
 
-    def test_setpoint_move_splits_session(self):
-        """Target 71 -> 72 mid warm-up: first session closes, a second
-        opens from the current temperature (no double-counted rise)."""
+    def test_setpoint_step_up_merges_session(self):
+        """Phase 8 Fix 2: target 71 -> 72 mid warm-up retargets the
+        session instead of closing it — one session, no double-counted
+        rise. A 1°F step is 0.56 K, above the change threshold, so the
+        old rule shredded every routine Sleep -> Wake -> Home warm-up."""
         sessions = _reconstruct([
             _sample(0, 66, 71, True),
             _sample(30, 68, 71, True),
@@ -172,8 +191,79 @@ class TestReconstructSessions(unittest.TestCase):
             _sample(70, 71.5, 72, True),
             _sample(75, 72, 72, True),
         ])
+        assert len(sessions) == 1
+        assert sessions[0].start_temp_c == fahrenheit_to_celsius(66)
+        assert sessions[0].end_temp_c == fahrenheit_to_celsius(72)
+        assert sessions[0].target_c == fahrenheit_to_celsius(72)
+        assert abs((sessions[0].end_ts - sessions[0].start_ts) / 60.0 - 75.0) < 0.01
+
+    def test_setpoint_step_down_splits_session(self):
+        """Phase 8 Fix 2: a step DOWN still ends the session — only a
+        step UP merges. Target 72 -> 71 mid warm-up: first session
+        closes, a second opens from the current temperature."""
+        sessions = _reconstruct([
+            _sample(0, 66, 72, True),
+            _sample(30, 68, 72, True),
+            _sample(31, 68, 71, True),
+            _sample(70, 71, 71, True),
+        ])
         assert len(sessions) == 2
         assert sessions[0].end_temp_c == sessions[1].start_temp_c
+
+    def test_step_up_at_target_closes_session(self):
+        """Phase 8 Fix 2: a step UP when the room is already at the
+        new target does not merge — the warm-up is over, so the
+        session closes and nothing new opens."""
+        sessions = _reconstruct([
+            _sample(0, 66, 71, True),
+            _sample(30, 68, 71, True),
+            _sample(31, 71.9, 72, True),
+            _sample(60, 71.9, 72, True),
+        ])
+        assert len(sessions) == 1
+        assert abs((sessions[0].end_ts - sessions[0].start_ts) / 60.0 - 31.0) < 0.01
+        assert sessions[0].end_temp_c == fahrenheit_to_celsius(71.9)
+
+    def test_long_idle_survives_with_backfill_grace(self):
+        """Phase 8 Fix 2: with the backfill's 15-min grace, a 10-min
+        furnace cycle mid-warm-up does not split the session (the
+        live observer's 5-min grace would close it at minute 37)."""
+        sessions = reconstruct_sessions(
+            [
+                _sample(0, 66, 71, True),
+                _sample(30, 68, 71, True),
+                _sample(32, 68.5, 71, False),
+                _sample(42, 68.5, 71, True),
+                _sample(65, 71, 71, True),
+            ],
+            non_heating_grace_min=15.0,
+            setpoint_change_k=PASSIVE_SETPOINT_CHANGE_K,
+            target_tolerance_k=TARGET_REACHED_TOLERANCE,
+        )
+        assert len(sessions) == 1
+        assert abs((sessions[0].end_ts - sessions[0].start_ts) / 60.0 - 65.0) < 0.01
+
+    def test_two_sample_session_has_outdoor_coverage(self):
+        """Phase 8: a session of just an opener + closer still counts
+        its outdoor readings — the opener's reading is accumulated
+        when the session opens, so it is not wrongly skipped as having
+        no outdoor coverage."""
+        base = datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc)
+        sessions = reconstruct_sessions(
+            [
+                ClimateSample(base.timestamp(), 18.0, 21.0, True, outdoor_c=5.0),
+                ClimateSample(
+                    (base + timedelta(minutes=20)).timestamp(),
+                    21.0, 21.0, True, outdoor_c=6.0,
+                ),
+            ],
+            non_heating_grace_min=PASSIVE_NON_HEATING_GRACE_MIN,
+            setpoint_change_k=PASSIVE_SETPOINT_CHANGE_K,
+            target_tolerance_k=TARGET_REACHED_TOLERANCE,
+        )
+        assert len(sessions) == 1
+        assert sessions[0].outdoor_known is True
+        assert sessions[0].outdoor_avg_c == 5.0
 
     def test_attach_outdoor_carry_forward(self):
         """Sparse outdoor samples carry forward to the climate samples."""
@@ -405,6 +495,161 @@ class TestThermalBackfill(_CoordinatorHarness):
         await self.coord._backfill_thermal_history()
         assert self.coord.thermal_learner.episode_count == 1
 
+    # -- Phase 8 Fix 1: never subtract an unmeasured deadtime --------
+
+    def _use_real_physics(self):
+        """Swap the harness's mocked physics for a real one (Radiator
+        profile, deadtime 15 min, never measured) so the measured
+        flag is meaningful."""
+        self.coord.physics = ThermalPhysics(
+            profile_data=HEATING_PROFILES[PROFILE_RADIATOR_NEW],
+            learning_rate=0.1,
+        )
+
+    async def _feed_return_shape(self):
+        """The Nov 17 15:32 return as one session: 20.7 min, 2.22 K
+        rise (67 -> 71 degF). True rate 6.4 K/hr; with the 15-min
+        Radiator deadtime subtracted it inflates to 23.4 K/hr and
+        the rate cap rejects it — the exact v2.14.3 live failure."""
+        base = datetime(2026, 11, 17, 15, 32, tzinfo=timezone.utc)
+        return await self.coord._feed_warmup_session(
+            start_ts=base.timestamp(),
+            start_temp_c=fahrenheit_to_celsius(67),
+            target_c=fahrenheit_to_celsius(71),
+            end_temp_c=fahrenheit_to_celsius(71),
+            end_ts=(base + timedelta(minutes=20.7)).timestamp(),
+            outdoor_avg_c=5.0,
+            outdoor_valid=True,
+            analyze_deadtime=False,
+            source="Backfilled",
+        )
+
+    async def test_unmeasured_deadtime_records_full_duration(self):
+        """Phase 8 Fix 1: the deadtime was never measured (profile
+        prior only), so it is passed as 0.0 — the effective duration
+        is the full 20.7 min and the 6.4 K/hr episode is recorded."""
+        self._use_real_physics()
+        assert self.coord.physics.deadtime_measured is False
+        assert await self._feed_return_shape() is True
+        assert self.coord.thermal_learner.episode_count == 1
+
+    async def test_measured_deadtime_still_subtracted(self):
+        """Phase 8 Fix 1: once the analyzer measures a deadtime, it
+        IS subtracted — the same session is then rejected by the rate
+        cap (23.4 K/hr), and the learner says why."""
+        self._use_real_physics()
+        self.coord.physics.update_deadtime(15.0)
+        assert self.coord.physics.deadtime_measured is True
+        assert await self._feed_return_shape() is False
+        assert self.coord.thermal_learner.episode_count == 0
+        assert self.coord.thermal_learner.last_reject_reason == "rate"
+
+    async def test_measured_deadtime_rejects_short_session(self):
+        """Phase 8 Fix 1: a 12-min session with a measured 15-min
+        deadtime has no effective heat-up — rejected as deadtime,
+        not silently dropped."""
+        self._use_real_physics()
+        self.coord.physics.update_deadtime(15.0)
+        base = datetime(2026, 11, 17, 8, 0, tzinfo=timezone.utc)
+        recorded = await self.coord._feed_warmup_session(
+            start_ts=base.timestamp(),
+            start_temp_c=fahrenheit_to_celsius(68),
+            target_c=fahrenheit_to_celsius(71),
+            end_temp_c=fahrenheit_to_celsius(71),
+            end_ts=(base + timedelta(minutes=12)).timestamp(),
+            outdoor_avg_c=5.0,
+            outdoor_valid=True,
+            analyze_deadtime=False,
+            source="Backfilled",
+        )
+        assert recorded is False
+        assert self.coord.thermal_learner.episode_count == 0
+        assert self.coord.thermal_learner.last_reject_reason == "deadtime"
+
+    # -- Phase 8 Fix 3: versioned re-run ------------------------------
+
+    async def test_versioned_rerun_resets_and_refeeds(self):
+        """Phase 8 Fix 3: a v2.14.3 store (flag set, no version, 1
+        stray episode) re-runs once: the learner is reset first, so
+        the window is re-fed from a clean slate instead of
+        double-counting the survivor."""
+        self.coord._backfill_done = True
+        self.coord.thermal_learner.record_episode(70.0, 1.7, 5.0, 15.0)
+        assert self.coord.thermal_learner.episode_count == 1
+        await self.coord._backfill_thermal_history()
+        assert self.coord._fetch_significant_states.await_count == 1
+        assert self.coord.thermal_learner.episode_count == 17
+        assert self.coord._backfill_version == 1
+        assert self.coord._backfill_done is True
+        self.coord.physics.reset.assert_called_once()
+
+    async def test_same_version_does_not_rerun(self):
+        """Phase 8 Fix 3: the same version never re-runs, even with a
+        learned model in place."""
+        self.coord._backfill_done = True
+        self.coord._backfill_version = 1
+        await self.coord._backfill_thermal_history()
+        assert self.coord._fetch_significant_states.await_count == 0
+        assert self.coord.thermal_learner.episode_count == 0
+
+    # -- Phase 8 Fix 2 (end to end) + Fix 4 ---------------------------
+
+    async def test_backfill_survives_ten_minute_idle_gap(self):
+        """Phase 8 Fix 2 end to end: the backfill's 15-min grace keeps
+        a warm-up with a 10-min furnace cycle in one session — one
+        episode, not two fragments (the live 5-min grace would split
+        it at the 16:10 idle sample)."""
+        history = {
+            CLIMATE: [
+                _climate_state(10, 15, 30, 71, 65, "heating"),
+                _climate_state(10, 16, 0, 71, 68, "heating"),
+                _climate_state(10, 16, 5, 71, 68.5, "idle"),
+                _climate_state(10, 16, 10, 71, 68.5, "idle"),
+                _climate_state(10, 16, 15, 71, 68.5, "heating"),
+                _climate_state(10, 16, 50, 71, 71, "heating"),
+                _climate_state(10, 22, 0, 68, 71, "idle"),
+            ],
+            WEATHER: [_weather_state(10, 4, 0, 45)],
+        }
+        self.coord._fetch_significant_states = AsyncMock(return_value=history)
+        await self.coord._backfill_thermal_history()
+        assert self.coord.thermal_learner.episode_count == 1
+
+    async def test_backfill_summary_is_warning_with_rejection_counts(self):
+        """Phase 8 Fix 4: the backfill summary logs at WARNING (the
+        HA UI log only surfaces WARNING+) with a rejection breakdown
+        — one session each rejected by deadtime, rate cap, and rise."""
+        history = {
+            CLIMATE: [
+                # Good session: 70 min, 1.67 K rise -> recorded.
+                _climate_state(10, 5, 0, 68, 68, "idle"),
+                _climate_state(10, 5, 30, 71, 68, "heating"),
+                _climate_state(10, 6, 0, 71, 69.5, "heating"),
+                _climate_state(10, 6, 40, 71, 71, "heating"),
+                # 12-min session, 1.67 K rise -> deadtime (15 - 12 < 0).
+                _climate_state(10, 8, 0, 71, 68, "heating"),
+                _climate_state(10, 8, 12, 71, 71, "heating"),
+                # 21-min session, 2.22 K rise -> rate (22.2 K/hr).
+                _climate_state(10, 10, 0, 71, 67, "heating"),
+                _climate_state(10, 10, 21, 71, 71, "heating"),
+                # 30-min session, 0.28 K rise -> rise too small.
+                _climate_state(10, 12, 0, 71, 70.5, "heating"),
+                _climate_state(10, 12, 30, 71, 71, "heating"),
+                _climate_state(10, 22, 0, 68, 71, "idle"),
+            ],
+            WEATHER: [_weather_state(10, 4, 0, 45)],
+        }
+        self.coord._fetch_significant_states = AsyncMock(return_value=history)
+        with self.assertLogs(
+            "custom_components.preheat.coordinator", level="WARNING"
+        ) as cm:
+            await self.coord._backfill_thermal_history()
+        summary = [r for r in cm.output if "Thermal backfill:" in r]
+        assert len(summary) == 1
+        assert "1 episode(s) from 4 warm-up session(s)" in summary[0]
+        assert "rejected: 1 deadtime, 1 rate, 1 other" in summary[0]
+        assert self.coord.thermal_learner.episode_count == 1
+
     async def test_fetch_seam_uses_recorder_api(self):
         """The history seam calls get_significant_states through the
         recorder instance's executor job, as the arrival bootstrap does."""
@@ -459,13 +704,32 @@ class TestBackfillScheduling(_CoordinatorHarness):
         for call in self.hass.loop.call_later.call_args_list:
             assert call.args[0] == 30
 
-    async def test_flagged_done_does_not_schedule(self):
-        """Store says done: no backfill scheduling (cutoff stays None).
-        Only the arrival bootstrap is scheduled."""
+    async def test_v2143_store_schedules_rerun(self):
+        """Phase 8 Fix 3: a v2.14.3 store (flag set, no version)
+        schedules the backfill once — the recorded version (0) is
+        older than BACKFILL_VERSION, so the fixed backfill re-runs
+        after the upgrade instead of being blocked by the flag."""
         self.coord._store.async_load = AsyncMock(
             return_value={"backfill_done": True}
         )
         await self.coord.async_load_data()
         assert self.coord._backfill_done is True
+        assert self.coord._backfill_version == 0
+        assert self.coord._backfill_cutoff is not None
+        assert self.hass.loop.call_later.call_count == 2
+
+    async def test_current_version_does_not_schedule(self):
+        """Phase 8 Fix 3: a store already at the current backfill
+        version does not schedule it (cutoff stays None). Only the
+        arrival bootstrap is scheduled."""
+        self.coord._store.async_load = AsyncMock(
+            return_value={
+                "backfill_done": True,
+                "backfill_version": BACKFILL_VERSION,
+            }
+        )
+        await self.coord.async_load_data()
+        assert self.coord._backfill_done is True
+        assert self.coord._backfill_version == BACKFILL_VERSION
         assert self.coord._backfill_cutoff is None
         assert self.hass.loop.call_later.call_count == 1

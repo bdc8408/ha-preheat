@@ -295,6 +295,33 @@ def test_predict_duration_uses_deadtime_and_rate():
     assert learner.predict_duration_min(0.0, 0.0) == 0.0
 
 
+def test_unmeasured_deadtime_keeps_prediction_prior():
+    """Phase 8 Fix 1: a 0.0 deadtime means "unmeasured", not "measured
+    zero" — recording with it must not clobber the synced profile
+    prior, or the prediction would lose its deadtime term. A measured
+    deadtime still overwrites it."""
+    learner = ThermalLearner()
+    learner.sync(15.0, 5.0, 6.0, 0.8)  # profile prior: 15 min
+    assert learner.record_episode(60.0, 2.0, 0.0, deadtime_min=0.0)
+    assert learner.deadtime_min == 15.0
+    assert learner.record_episode(60.0, 2.0, 0.0, deadtime_min=5.0)
+    assert learner.deadtime_min == 5.0
+
+
+def test_reject_reason_is_reported():
+    """Phase 8 Fix 4: record_episode reports why it rejected, so the
+    backfill summary can count rejections by reason."""
+    learner = ThermalLearner()
+    assert learner.record_episode(60.0, 0.1, 0.0, 0.0) is False
+    assert learner.last_reject_reason == "rise"
+    assert learner.record_episode(12.0, 2.0, 0.0, 10.0) is False
+    assert learner.last_reject_reason == "deadtime"
+    assert learner.record_episode(16.0, 5.0, 0.0, 10.0) is False
+    assert learner.last_reject_reason == "rate"
+    assert learner.record_episode(60.0, 2.0, 0.0, 0.0) is True
+    assert learner.last_reject_reason is None
+
+
 def test_rejects_implausible_episodes():
     learner = ThermalLearner()
     assert learner.record_episode(60.0, 0.1, 0.0, 0.0) is False  # rise too small

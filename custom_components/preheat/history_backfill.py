@@ -3,11 +3,11 @@
 Pure functions (no Home Assistant imports) so the session logic is
 unit-testable without a coordinator. The state machine mirrors the live
 passive observer (``PreheatingCoordinator._observe_passive_warmup``)
-exactly:
+except where noted below:
 
 - a session opens when the burner is heating and the room is below the
   target minus the reached tolerance;
-- it closes when the setpoint moves by more than the setpoint-change
+- it closes when the setpoint moves DOWN by more than the setpoint-change
   threshold, when the target is reached, or after the non-heating grace
   period with the burner off;
 - a session still open at the end of the samples is discarded — it
@@ -29,6 +29,18 @@ Deliberately NOT mirrored from the live path:
   for a historical session would be meaningless. Backfilled sessions
   use the physics model's current deadtime.
 - No cooling-analyzer feeding. This module is warm-up episodes only.
+
+Fork Phase 8: a setpoint step UP while the room is still heating
+toward the new target RETARGETS the open session instead of closing
+it — a 1°F step is 0.56 K, above the change threshold, so the old
+rule shredded every routine Sleep -> Wake -> Home warm-up into
+fragments that each failed the learner's guards. Only a step DOWN
+(or the target actually being reached) ends a session. The live
+observer still closes on any setpoint move (it cannot tell a step-up
+from a mode change in real time); the backfill, which sees the whole
+window, can. The backfill also uses a longer non-heating grace
+(15 min, passed by the coordinator) because the furnace cycles off
+mid-warm-up.
 
 All temperatures are °C/K (the Phase 1 unit rule); unit conversion
 happens in the coordinator at ingestion.
@@ -123,12 +135,17 @@ def reconstruct_sessions(
 
     def open_new(sample: ClimateSample) -> dict | None:
         if sample.heating and sample.temp_c < sample.target_c - target_tolerance_k:
+            # Fork Phase 8: the opening sample's outdoor reading
+            # counts toward the session. Without this, a session of
+            # just an opener + closer accumulated nothing (only
+            # continuation samples were counted) and was wrongly
+            # skipped as having no outdoor coverage.
             return {
                 "start_ts": sample.ts,
                 "start_temp_c": sample.temp_c,
                 "target_c": sample.target_c,
-                "outdoor_sum_c": 0.0,
-                "outdoor_n": 0,
+                "outdoor_sum_c": sample.outdoor_c if sample.outdoor_c is not None else 0.0,
+                "outdoor_n": 1 if sample.outdoor_c is not None else 0,
                 "non_heating_since": None,
             }
         return None
@@ -145,13 +162,25 @@ def reconstruct_sessions(
         else:
             # A setpoint move ends the session against the temperature
             # achieved so far; this sample may open a fresh one.
-            if abs(sample.target_c - open_session["target_c"]) > setpoint_change_k:
+            # Fork Phase 8: a step UP while still heating toward the
+            # new target retargets the session instead of closing it
+            # (see module docstring). Only a step DOWN closes it.
+            delta_target = sample.target_c - open_session["target_c"]
+            closed = False
+            if (
+                delta_target > setpoint_change_k
+                and sample.temp_c < sample.target_c - target_tolerance_k
+            ):
+                open_session["target_c"] = sample.target_c
+            elif abs(delta_target) > setpoint_change_k:
                 sessions.append(finish(open_session, sample.ts, sample.temp_c))
                 open_session = open_new(sample)
+                closed = True
             elif sample.target_c <= sample.temp_c + target_tolerance_k:
                 sessions.append(finish(open_session, sample.ts, sample.temp_c))
                 open_session = None
-            else:
+                closed = True
+            if not closed and open_session is not None:
                 if sample.outdoor_c is not None:
                     open_session["outdoor_sum_c"] += sample.outdoor_c
                     open_session["outdoor_n"] += 1

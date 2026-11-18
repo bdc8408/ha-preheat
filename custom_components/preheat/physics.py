@@ -24,6 +24,11 @@ class ThermalModelData:
     sample_count: int
     avg_error: float = 0.0 # Exponential Moving Average of absolute error used for quality metric
     deadtime: float = 0.0 # V3: Deadtime (Totzeit) in minutes
+    # Fork Phase 8: True only when the deadtime was measured by the
+    # analyzer (via update_deadtime). A stored deadtime of 0.0 means
+    # "never measured" and is replaced by the profile default at
+    # load, so the flag — not the value — is the measurement signal.
+    deadtime_measured: bool = False
 
 class ThermalPhysics:
     """
@@ -77,6 +82,12 @@ class ThermalPhysics:
             self.loss_factor = data.loss_factor if data.loss_factor is not None else DEFAULT_LOSS_FACTOR
             self.sample_count = data.sample_count
             
+            # Fork Phase 8: restore the measured-deadtime flag. A
+            # stored deadtime is a measurement only when this flag is
+            # set; the load path below substitutes the profile default
+            # for 0.0, which must never count as measured.
+            self.deadtime_measured = bool(getattr(data, "deadtime_measured", False))
+            
             # Sanitize Avg Error and Deadtime (getattr returns None if attr is None!)
             d_err = getattr(data, "avg_error", 0.0)
             self.avg_error = d_err if d_err is not None else 0.0
@@ -95,6 +106,7 @@ class ThermalPhysics:
             self.sample_count = 0
             self.avg_error = 0.0
             self.deadtime = initial_deadtime
+            self.deadtime_measured = False
 
     def reset(self, profile_data: dict | None = None) -> None:
         """Reset learned parameters to the (given or initial) heating profile defaults."""
@@ -109,6 +121,9 @@ class ThermalPhysics:
         self.deadtime = profile.get("deadtime", 0.0)
         self.sample_count = 0
         self.avg_error = 0.0
+        # Back to profile defaults: the deadtime is a prior again,
+        # not a measurement.
+        self.deadtime_measured = False
 
     def calculate_duration(self, delta_t_internal: float, delta_t_external: float) -> float:
         """
@@ -141,6 +156,11 @@ class ThermalPhysics:
     
     def update_deadtime(self, new_deadtime: float) -> None:
         """Update the deadtime parameter (usually from DeadtimeAnalyzer)."""
+        # Fork Phase 8: any value arriving here is a measurement (both
+        # call sites pass analyzer output), so mark it measured. The
+        # load path substitutes the profile default for an unmeasured
+        # 0.0, which must never set this flag.
+        self.deadtime_measured = True
         # Cold start: take the first measured value as-is; afterwards apply EMA smoothing (0.2/0.8).
         if self.deadtime == 0.0:
             self.deadtime = new_deadtime
@@ -288,5 +308,6 @@ class ThermalPhysics:
             "loss_factor": self.loss_factor,
             "sample_count": self.sample_count,
             "avg_error": self.avg_error,
-            "deadtime": self.deadtime
+            "deadtime": self.deadtime,
+            "deadtime_measured": self.deadtime_measured,
         }
