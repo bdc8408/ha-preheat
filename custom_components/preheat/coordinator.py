@@ -172,6 +172,16 @@ PASSIVE_SETPOINT_CHANGE_K = 0.5
 # states (about 500/day are expected; the cap is ~4x headroom).
 BACKFILL_DAYS = 10
 BACKFILL_MAX_STATES = 20000
+# Fork (v2.14.4, backfill re-run): the backfill logic version stored
+# in the store. The v2.14.3 backfill stored no version (implicitly 0);
+# bump this constant whenever the backfill or its guards change so a
+# versioned re-run fires once on the next restart.
+BACKFILL_VERSION = 1
+# Fork (v2.14.4): the backfill's non-heating grace. The furnace cycles
+# off mid-warm-up, so the 5-minute live grace shreds real warm-ups;
+# the backfill (which sees the whole window) waits 15 minutes before
+# concluding a warm-up ended. The live observer keeps 5 minutes.
+BACKFILL_NON_HEATING_GRACE_MIN = 15.0
 
 def _next_time_of_day(now: datetime, minutes: int) -> datetime:
     """Next datetime at ``minutes`` since local midnight.
@@ -372,6 +382,12 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         # captured when the backfill is scheduled, so sessions closing
         # after it belong to the live observer, never to the backfill.
         self._backfill_done: bool = False
+        # Fork (v2.14.4): the backfill logic version that last ran
+        # (stored in the store; v2.14.3 stored no version, so it
+        # reads as 0). The backfill runs when this is below
+        # BACKFILL_VERSION, so a fixed backfill re-runs once after
+        # an upgrade instead of being blocked forever by the flag.
+        self._backfill_version: int = 0
         self._backfill_cutoff: datetime | None = None
         # self._occupancy_on_since: datetime | None = None # Moved to SessionManager
         self._preheat_active: bool = False
@@ -592,7 +608,10 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                     loss_factor=data.get(ATTR_MODEL_LOSS, 5.0), # Default
                     sample_count=data.get("sample_count", 0),
                     avg_error=data.get("avg_error", 0.0),
-                    deadtime=data.get("deadtime", 0.0)
+                    deadtime=data.get("deadtime", 0.0),
+                    # Fork Phase 8: whether the deadtime was measured
+                    # by the analyzer (persists via _get_data_for_storage).
+                    deadtime_measured=bool(data.get("deadtime_measured", False)),
                 ) if mass is not None or ATTR_MODEL_LOSS in data else None
                 
                 learning_rate = self._get_conf(CONF_EMA_ALPHA, 0.1)
@@ -748,6 +767,13 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             self.bootstrap_done = data.get("bootstrap_done", False)
             # Fork (v2.14.3): one-time thermal history backfill flag.
             self._backfill_done = bool(data.get("backfill_done", False))
+            # Fork (v2.14.4): the backfill logic version that last
+            # ran. v2.14.3 stored no version, so a store from that
+            # release reads as 0 and the fixed backfill re-runs once.
+            try:
+                self._backfill_version = int(data.get("backfill_version", 0))
+            except (TypeError, ValueError):
+                self._backfill_version = 0
 
             # v2.9.0 Fix: If bootstrap claimed done, but departures missing (e.g. key counting bug), reset it.
             if self.bootstrap_done:
@@ -771,7 +797,10 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             # closing after it belong to the live observer, never to
             # the backfill. Runs even for a fresh install (empty
             # store), which is the install with no episodes at all.
-            if not self._backfill_done:
+            # Fork (v2.14.4): versioned — a store whose recorded
+            # version is older than BACKFILL_VERSION re-runs once, so
+            # a fixed backfill is not blocked forever by the flag.
+            if self._backfill_version < BACKFILL_VERSION:
                 self._backfill_cutoff = dt_util.utcnow()
                 self.hass.loop.call_later(
                     30, lambda: self.hass.async_create_task(self._backfill_thermal_history())
@@ -807,6 +836,10 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             "bootstrap_done": self.bootstrap_done,
             # Fork (v2.14.3): one-time thermal history backfill flag.
             "backfill_done": self._backfill_done,
+            # Fork (v2.14.4): the backfill logic version that last ran,
+            # and whether the physics deadtime was measured (Phase 8).
+            "backfill_version": self._backfill_version,
+            "deadtime_measured": data_physics.get("deadtime_measured", False),
             # Fork Phase 4: learned schedule + explicit thermal model.
             "schedule_learning": self.schedule_learner.to_dict(),
             "thermal_learning": self.thermal_learner.to_dict(),
@@ -835,6 +868,9 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                 # save too, or a no-temperature save would drop it and
                 # the backfill would run again on the next restart.
                 stored_data["backfill_done"] = self._backfill_done
+                # Fork (v2.14.4): same for the backfill version, or a
+                # partial save would lose the version and re-run it.
+                stored_data["backfill_version"] = self._backfill_version
                 stored_data["enable_active"] = self.enable_active
                 stored_data["diagnostics"] = self.diagnostics.data
                 stored_data["cumulative_shadow_savings"] = self._shadow_metrics.get("cumulative_shadow_savings", 0.0)
@@ -3001,6 +3037,7 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         outdoor_valid: bool,
         analyze_deadtime: bool = True,
         source: str = "Passive",
+        stats: dict[str, int] | None = None,
     ) -> bool:
         """Feed one completed warm-up to the thermal model.
 
@@ -3019,6 +3056,21 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         live history buffer holds no samples from the backfill window,
         so analysing it would be meaningless — backfilled sessions use
         the physics model's current deadtime.
+
+        Fork Phase 8: the deadtime passed to ``record_episode`` is
+        the MEASURED deadtime only. ``physics.deadtime`` is a profile
+        prior (15 min for Radiators) until the analyzer measures a
+        real one, and subtracting the prior rejects every real
+        warm-up in this house (5–13 min cycles go to <= 0 effective
+        minutes; longer legs inflate past the rate cap). An
+        unmeasured deadtime is passed as 0.0, so the effective
+        duration is the full duration. The prediction path is
+        untouched: ``calculate_duration`` and the learner sync still
+        use the profile deadtime as a prior.
+
+        ``stats`` (when given) counts the outcome by reason —
+        "recorded", "deadtime", "rate", "other" (rise too small and
+        anything else) — for the backfill summary.
         """
         duration = max(0.0, (end_ts - start_ts) / 60.0)
         delta_in = end_temp_c - start_temp_c
@@ -3027,6 +3079,8 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                 "[%s] %s warm-up skipped: rise %.2f K too small",
                 self.device_name, source, delta_in,
             )
+            if stats is not None:
+                stats["other"] += 1
             return False
         # Deadtime analysis over the warm-up, as in _stop_preheat.
         if analyze_deadtime:
@@ -3051,11 +3105,25 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             duration, delta_in, delta_out, valve_pos_avg,
             outdoor_valid=outdoor_valid,
         )
+        # Fork Phase 8: only a measured deadtime is subtracted in the
+        # learning guards (see docstring). getattr with a False
+        # default keeps the old behaviour for a mocked physics model
+        # in tests (its deadtime_measured attribute is a truthy mock).
+        deadtime_for_learning = (
+            self.physics.deadtime
+            if getattr(self.physics, "deadtime_measured", False)
+            else 0.0
+        )
         recorded = self.thermal_learner.record_episode(
-            duration, delta_in, outdoor_avg_c, self.physics.deadtime
+            duration, delta_in, outdoor_avg_c, deadtime_for_learning
         )
         if recorded:
             self._passive_episodes += 1
+            if stats is not None:
+                stats["recorded"] += 1
+        elif stats is not None:
+            reason = getattr(self.thermal_learner, "last_reject_reason", None)
+            stats["deadtime" if reason == "deadtime" else "rate" if reason == "rate" else "other"] += 1
         if success or recorded:
             self.diagnostics.data["last_learning_attempt_ts"] = dt_util.utcnow().timestamp()
             await self._async_save_data()
@@ -3147,6 +3215,24 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             samples.append((ts, to_celsius(value, unit)))
         return samples
 
+    def _reset_thermal_learning_state(self) -> None:
+        """Clean slate for a versioned backfill re-run.
+
+        Restores the physics model to the current profile defaults
+        and replaces the learner with a fresh one, so a fixed
+        backfill re-learns the same history window instead of
+        double-counting the previous version's survivors. The
+        prediction prior (profile deadtime) is re-synced into the
+        fresh learner; the measured-deadtime flag resets to False
+        with the profile defaults (``physics.reset``).
+        """
+        profile_key = self._get_conf(CONF_HEATING_PROFILE, PROFILE_RADIATOR_NEW)
+        profile_data = HEATING_PROFILES.get(profile_key, HEATING_PROFILES[PROFILE_RADIATOR_NEW])
+        self.physics.reset(profile_data)
+        self.thermal_learner = ThermalLearner()
+        self._passive_episodes = 0
+        self._sync_thermal_learner()
+
     async def _backfill_thermal_history(self) -> None:
         """One-time bootstrap: learn the thermal model from recorder history.
 
@@ -3160,21 +3246,56 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         control behaviour changes, and no confidence gate is relaxed —
         the model reports whatever episode count the history supports.
 
-        Once-only: ``backfill_done`` is set (and saved) BEFORE the
-        work, so one attempt is all there ever is — no retry loop, and
-        a crash mid-feed can never double-count sessions on the next
-        restart. Sessions are reconstructed only up to the cutoff
-        captured when the backfill was scheduled, so a warm-up the live
-        observer is watching can never be fed twice: sessions closing
-        after the cutoff belong to the live observer alone.
+        Versioned once-only: ``backfill_version`` is stamped (and
+        saved) BEFORE the work, so one attempt per version is all
+        there ever is — no retry loop, and a crash mid-feed can never
+        double-count sessions on the next restart. A store whose
+        recorded version is older than BACKFILL_VERSION re-runs once
+        (the v2.14.3 backfill stored no version, so it reads as 0 and
+        the fixed backfill re-runs after the upgrade); on a re-run
+        the thermal learning state is reset first, so the same
+        window is re-learned from a clean slate instead of
+        double-counting the previous version's survivors. The legacy
+        ``backfill_done`` flag is what marks a store as a re-run
+        (a previous version ran) rather than a first run — a first
+        run still skips when the live observer already taught the
+        model. The same version never re-runs. Sessions are reconstructed only up to
+        the cutoff captured when the backfill was scheduled, so a
+        warm-up the live observer is watching can never be fed twice:
+        sessions closing after the cutoff belong to the live observer
+        alone.
         """
-        if self._backfill_done:
+        if self._backfill_version >= BACKFILL_VERSION:
             return
-        # Mark done first (see docstring): one attempt, then done.
+        # Mark the version (and the legacy flag) first (see docstring):
+        # one attempt per version, then done.
+        stored_version = self._backfill_version
+        # The legacy flag is the re-run signal: v2.14.3 stamped it
+        # without a version, so a store with backfill_done=True and
+        # no version is a previous backfill version that already fed
+        # (possibly wrong) episodes. A fresh install has it False.
+        stored_done = self._backfill_done
+        self._backfill_version = BACKFILL_VERSION
         self._backfill_done = True
         await self._async_save_data()
         try:
-            if self.thermal_learner.episode_count > 0 or self.physics.sample_count > 0:
+            if stored_done:
+                # Versioned re-run: a previous backfill version
+                # already fed (possibly wrong) episodes into this
+                # model. Reset first so the fixed logic re-learns
+                # the same window from a clean slate instead of
+                # double-counting the survivors. This also wipes
+                # any episodes the live observer recorded since the
+                # old backfill — a deliberate trade-off (live state
+                # is 1 episode / 0 samples, so nothing worth
+                # preserving is lost).
+                self._reset_thermal_learning_state()
+                _LOGGER.info(
+                    "[%s] Thermal backfill re-run (v%d -> v%d): "
+                    "thermal learning state reset",
+                    self.device_name, stored_version, BACKFILL_VERSION,
+                )
+            elif self.thermal_learner.episode_count > 0 or self.physics.sample_count > 0:
                 _LOGGER.info(
                     "[%s] Thermal backfill skipped: model already has %d episode(s)",
                     self.device_name, self.thermal_learner.episode_count,
@@ -3220,11 +3341,11 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             )
             sessions = reconstruct_sessions(
                 samples,
-                non_heating_grace_min=PASSIVE_NON_HEATING_GRACE_MIN,
+                non_heating_grace_min=BACKFILL_NON_HEATING_GRACE_MIN,
                 setpoint_change_k=PASSIVE_SETPOINT_CHANGE_K,
                 target_tolerance_k=TARGET_REACHED_TOLERANCE,
             )
-            fed = 0
+            stats = {"recorded": 0, "deadtime": 0, "rate": 0, "other": 0}
             skipped_no_outdoor = 0
             for session in sessions:
                 if not session.outdoor_known:
@@ -3233,7 +3354,7 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                     # the regression as if it were measured.
                     skipped_no_outdoor += 1
                     continue
-                if await self._feed_warmup_session(
+                await self._feed_warmup_session(
                     start_ts=session.start_ts,
                     start_temp_c=session.start_temp_c,
                     target_c=session.target_c,
@@ -3243,13 +3364,20 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                     outdoor_valid=session.outdoor_known,
                     analyze_deadtime=False,
                     source="Backfilled",
-                ):
-                    fed += 1
-            _LOGGER.info(
+                    stats=stats,
+                )
+            # Fork Phase 8: WARNING, not INFO — this is a one-time
+            # bootstrap event, and the HA UI log only surfaces
+            # WARNING and above, so the INFO summary was invisible
+            # live (a successful v2.14.3 run looked like a silent
+            # failure). The rejection breakdown shows which guard
+            # ate the sessions that did not become episodes.
+            _LOGGER.warning(
                 "[%s] Thermal backfill: %d episode(s) from %d warm-up session(s) "
-                "(%d skipped: no outdoor coverage) "
+                "(%d skipped: no outdoor coverage; rejected: %d deadtime, %d rate, %d other) "
                 "in %d climate states (learner episodes=%d, confident=%s)",
-                self.device_name, fed, len(sessions), skipped_no_outdoor,
+                self.device_name, stats["recorded"], len(sessions), skipped_no_outdoor,
+                stats["deadtime"], stats["rate"], stats["other"],
                 len(climate_states),
                 self.thermal_learner.episode_count, self.thermal_learner.is_confident,
             )
