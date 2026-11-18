@@ -454,6 +454,64 @@ class TestPhase4CoordinatorWiring(unittest.IsolatedAsyncioTestCase):
         assert pred["duration_source"] == "thermal_learner"
         assert abs(pred["predicted_duration"] - 118.0) < 5.0
 
+    async def test_physics_simulation_forecast_prefers_thermal_duration(self):
+        # Forecast-branch mirror of the static-branch test above (Fix B):
+        # same 2 K rise in 118 min (10 deadtime + 108 heating).
+        for _ in range(5):
+            self.coord.thermal_learner.record_episode(118.0, 2.0, 0.0, 10.0)
+        # The forecast branch needs a weather service; the harness
+        # leaves it None (no weather entity configured).
+        self.coord.weather_service = MagicMock()
+        # physics.calculate_effective_outdoor_temp reads its own
+        # dt_util (not the coordinator's patched one); point it at
+        # the same fake clock so the forecast window is real.
+        phys_patcher = patch("custom_components.preheat.physics.dt_util", self.clock)
+        phys_patcher.start()
+        self.addCleanup(phys_patcher.stop)
+        forecasts = [
+            {"datetime": T0 + timedelta(hours=h), "temperature": 0.0}
+            for h in range(7)
+        ]
+        ctx = {
+            "target_setpoint": 21.0,
+            "operative_temp": 19.0,
+            "outdoor_temp": 0.0,
+            "forecasts": forecasts,
+        }
+        pred = await self.coord._run_physics_simulation(ctx)
+        # Physics (bare-default: 0 + 10*2 + 5*21 = 125 min) vs thermal
+        # 118 min: 6% apart, inside the 50% guard -> thermal wins.
+        assert pred["duration_source"] == "thermal_learner"
+        assert abs(pred["predicted_duration"] - 118.0) < 5.0
+
+    async def test_physics_simulation_forecast_falls_back_on_disagreement(self):
+        # Forecast branch (Fix B): learner is confident but far too
+        # fast — 2 K in 22 min (10 deadtime + 12 heating) vs physics
+        # 125 min, 82% apart -> physics wins, with the warning.
+        for _ in range(5):
+            self.coord.thermal_learner.record_episode(22.0, 2.0, 0.0, 10.0)
+        self.coord.weather_service = MagicMock()
+        phys_patcher = patch("custom_components.preheat.physics.dt_util", self.clock)
+        phys_patcher.start()
+        self.addCleanup(phys_patcher.stop)
+        forecasts = [
+            {"datetime": T0 + timedelta(hours=h), "temperature": 0.0}
+            for h in range(7)
+        ]
+        ctx = {
+            "target_setpoint": 21.0,
+            "operative_temp": 19.0,
+            "outdoor_temp": 0.0,
+            "forecasts": forecasts,
+        }
+        with self.assertLogs(
+            "custom_components.preheat.coordinator", level="WARNING"
+        ) as logs:
+            pred = await self.coord._run_physics_simulation(ctx)
+        assert pred["duration_source"] == "physics"
+        assert abs(pred["predicted_duration"] - 125.0) < 1.0
+        assert any("disagrees" in line for line in logs.output)
+
     async def test_physics_simulation_falls_back_without_episodes(self):
         ctx = {
             "target_setpoint": 21.0,
