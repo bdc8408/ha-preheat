@@ -138,6 +138,11 @@ from .physics import ThermalPhysics, ThermalModelData
 from .schedule_learner import ScheduleLearner, day_type_for
 from .thermal_learner import ThermalLearner, MIN_DELTA_K
 from .history_buffer import RingBuffer, DeadtimeAnalyzer, HistoryPoint
+from .history_backfill import (
+    ClimateSample,
+    attach_outdoor,
+    reconstruct_sessions,
+)
 from .weather_service import WeatherService
 from .optimal_stop import OptimalStopManager
 from .cooling_analyzer import CoolingAnalyzer
@@ -162,6 +167,11 @@ PASSIVE_NON_HEATING_GRACE_MIN = 5.0
 # A setpoint move larger than this ends the current warm-up session
 # (the next cycle opens a fresh one from the current temperature).
 PASSIVE_SETPOINT_CHANGE_K = 0.5
+# Fork (v2.14.3, thermal history backfill): how far back the one-time
+# backfill reads recorder history, and the defensive cap on climate
+# states (about 500/day are expected; the cap is ~4x headroom).
+BACKFILL_DAYS = 10
+BACKFILL_MAX_STATES = 20000
 
 def _next_time_of_day(now: datetime, minutes: int) -> datetime:
     """Next datetime at ``minutes`` since local midnight.
@@ -355,6 +365,14 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         # outdoor_n, non_heating_since}.
         self._passive_warmup: dict | None = None
         self._passive_episodes: int = 0
+        # Fork (v2.14.3, thermal history backfill): one-time bootstrap
+        # that learns the thermal model from recorder history instead
+        # of waiting for future warm-ups. The flag persists in the
+        # store so it never re-runs on later restarts; the cutoff is
+        # captured when the backfill is scheduled, so sessions closing
+        # after it belong to the live observer, never to the backfill.
+        self._backfill_done: bool = False
+        self._backfill_cutoff: datetime | None = None
         # self._occupancy_on_since: datetime | None = None # Moved to SessionManager
         self._preheat_active: bool = False
         self._frost_active: bool = False # Safety override (v2.9.1)
@@ -728,6 +746,8 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             
             # Load Bootstrap State FIRST (before scheduling timer)
             self.bootstrap_done = data.get("bootstrap_done", False)
+            # Fork (v2.14.3): one-time thermal history backfill flag.
+            self._backfill_done = bool(data.get("backfill_done", False))
 
             # v2.9.0 Fix: If bootstrap claimed done, but departures missing (e.g. key counting bug), reset it.
             if self.bootstrap_done:
@@ -744,6 +764,18 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                  # Short delay to let HA fully initialize before querying recorder
                  _LOGGER.info("[%s] History scan will start in 30 seconds...", self.device_name)
                  self.hass.loop.call_later(30, lambda: self.hass.async_create_task(self._check_bootstrap()))
+
+            # Fork (v2.14.3): schedule the one-time thermal history
+            # backfill. Same 30 s delay as the arrival bootstrap so the
+            # recorder is ready. The cutoff is captured now: sessions
+            # closing after it belong to the live observer, never to
+            # the backfill. Runs even for a fresh install (empty
+            # store), which is the install with no episodes at all.
+            if not self._backfill_done:
+                self._backfill_cutoff = dt_util.utcnow()
+                self.hass.loop.call_later(
+                    30, lambda: self.hass.async_create_task(self._backfill_thermal_history())
+                )
                 
         except Exception:
             _LOGGER.exception("Failed loading data")
@@ -773,6 +805,8 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             "diagnostics": self.diagnostics.data,
             # V2.9.2
             "bootstrap_done": self.bootstrap_done,
+            # Fork (v2.14.3): one-time thermal history backfill flag.
+            "backfill_done": self._backfill_done,
             # Fork Phase 4: learned schedule + explicit thermal model.
             "schedule_learning": self.schedule_learner.to_dict(),
             "thermal_learning": self.thermal_learner.to_dict(),
@@ -797,6 +831,10 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                 stored_data["physics_version"] = self.extra_store_data.get("physics_version", 2)
                 stored_data[ATTR_ARRIVAL_HISTORY] = self.planner.to_dict()
                 stored_data["bootstrap_done"] = self.bootstrap_done
+                # Fork (v2.14.3): keep the backfill flag in the partial
+                # save too, or a no-temperature save would drop it and
+                # the backfill would run again on the next restart.
+                stored_data["backfill_done"] = self._backfill_done
                 stored_data["enable_active"] = self.enable_active
                 stored_data["diagnostics"] = self.diagnostics.data
                 stored_data["cumulative_shadow_savings"] = self._shadow_metrics.get("cumulative_shadow_savings", 0.0)
@@ -1811,6 +1849,25 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             predicted_duration = uncapped_duration # It IS the converged duration
             outdoor_effective = self.physics.calculate_effective_outdoor_temp(ctx["forecasts"], uncapped_duration / 60.0)
             delta_out = ctx["target_setpoint"] - outdoor_effective
+
+            # Fork Phase 7: same confident-learner override as the
+            # static branch. Without it the learner can never move
+            # preheat timing on the forecast path — the path the
+            # daily-arrival decision actually runs.
+            thermal_duration = self.thermal_learner.predict_duration_min(
+                delta_in, outdoor_effective
+            )
+            if thermal_duration is not None and uncapped_duration > 0:
+                if abs(thermal_duration - uncapped_duration) / uncapped_duration <= 0.5:
+                    predicted_duration = thermal_duration
+                    uncapped_duration = predicted_duration
+                    duration_source = "thermal_learner"
+                else:
+                    _LOGGER.warning(
+                        "[%s] Thermal-learner duration %.0f min disagrees with "
+                        "physics %.0f min (>50%%); using physics",
+                        self.device_name, thermal_duration, uncapped_duration,
+                    )
 
         else:
              # Standard Static Calc
@@ -2915,44 +2972,87 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             await self._close_passive_warmup(op_temp, now)
 
     async def _close_passive_warmup(self, end_temp: float, end: datetime) -> None:
-        """Feed one completed passive warm-up to the thermal model.
-
-        Mirrors the learning block of _stop_preheat: same guards
-        (rise >= MIN_DELTA_K, plausible rate, deadtime), same calls
-        (physics.update_model, thermal_learner.record_episode), same
-        persistence. Returns silently when the session does not
-        qualify — short top-up cycles and sub-degree rises are not
-        episodes.
-        """
+        """Feed one completed passive warm-up to the thermal model."""
         session = self._passive_warmup
         self._passive_warmup = None
         if session is None:
             return
-        start_ts = session["start_ts"]
-        duration = max(0.0, (end.timestamp() - start_ts) / 60.0)
-        delta_in = end_temp - session["start_temp_c"]
-        outdoor = session["outdoor_sum_c"] / max(1, session["outdoor_n"])
-        target = session["target_c"]
+        await self._feed_warmup_session(
+            start_ts=session["start_ts"],
+            start_temp_c=session["start_temp_c"],
+            target_c=session["target_c"],
+            end_temp_c=end_temp,
+            end_ts=end.timestamp(),
+            outdoor_avg_c=session["outdoor_sum_c"] / max(1, session["outdoor_n"]),
+            outdoor_valid=self._outdoor_is_real,
+            analyze_deadtime=True,
+            source="Passive",
+        )
+
+    async def _feed_warmup_session(
+        self,
+        *,
+        start_ts: float,
+        start_temp_c: float,
+        target_c: float,
+        end_temp_c: float,
+        end_ts: float,
+        outdoor_avg_c: float,
+        outdoor_valid: bool,
+        analyze_deadtime: bool = True,
+        source: str = "Passive",
+    ) -> bool:
+        """Feed one completed warm-up to the thermal model.
+
+        Shared by the live observer (``_close_passive_warmup``) and the
+        one-time history backfill, so both learn from the same data
+        through the same guards. Mirrors the learning block of
+        ``_stop_preheat``: rise >= MIN_DELTA_K, plausible rate and
+        effective duration (enforced inside
+        ``ThermalLearner.record_episode``), deadtime analysis, then
+        the same ``physics.update_model`` /
+        ``thermal_learner.record_episode`` calls and persistence.
+        Returns True when the learner recorded the episode. Short
+        top-up cycles and sub-degree rises are not episodes.
+
+        ``analyze_deadtime`` is False for backfilled sessions: the
+        live history buffer holds no samples from the backfill window,
+        so analysing it would be meaningless — backfilled sessions use
+        the physics model's current deadtime.
+        """
+        duration = max(0.0, (end_ts - start_ts) / 60.0)
+        delta_in = end_temp_c - start_temp_c
         if delta_in < MIN_DELTA_K:
             _LOGGER.debug(
-                "[%s] Passive warm-up skipped: rise %.2f K too small",
-                self.device_name, delta_in,
+                "[%s] %s warm-up skipped: rise %.2f K too small",
+                self.device_name, source, delta_in,
             )
-            return
+            return False
         # Deadtime analysis over the warm-up, as in _stop_preheat.
-        new_deadtime = self.deadtime_analyzer.analyze(self.history_buffer.get_all())
-        if new_deadtime:
-            self.physics.update_deadtime(new_deadtime)
-        delta_out = target - outdoor
-        valve_pos_avg = self.history_buffer.get_average_valve(start_ts, end.timestamp())
+        if analyze_deadtime:
+            new_deadtime = self.deadtime_analyzer.analyze(self.history_buffer.get_all())
+            if new_deadtime:
+                self.physics.update_deadtime(new_deadtime)
+        delta_out = target_c - outdoor_avg_c
+        valve_pos_avg = self.history_buffer.get_average_valve(start_ts, end_ts)
         if valve_pos_avg is None:
             valve_pos_avg = self._get_valve_position_with_fallback("passive")
+        # Fork Phase 7: a house with no valve source at all must not
+        # feed 0.0 — the physics valve guard rejects 0.0, so the model
+        # could never learn here. Pass None (the guard in update_model
+        # is skipped when valve_position is None) only when there is
+        # no valve source; a real valve sensor reading 0% still keeps
+        # the guard. Keyed on _get_valve_position(), not the averaged
+        # value: the history buffer stores 0.0 for valveless houses,
+        # so the average is indistinguishable from a real valve at 0%.
+        if self._get_valve_position() is None:
+            valve_pos_avg = None
         success = self.physics.update_model(
             duration, delta_in, delta_out, valve_pos_avg,
-            outdoor_valid=self._outdoor_is_real,
+            outdoor_valid=outdoor_valid,
         )
         recorded = self.thermal_learner.record_episode(
-            duration, delta_in, outdoor, self.physics.deadtime
+            duration, delta_in, outdoor_avg_c, self.physics.deadtime
         )
         if recorded:
             self._passive_episodes += 1
@@ -2960,10 +3060,202 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             self.diagnostics.data["last_learning_attempt_ts"] = dt_util.utcnow().timestamp()
             await self._async_save_data()
             _LOGGER.info(
-                "[%s] Passive warm-up learned: %.0f min, %.2f K rise, "
+                "[%s] %s warm-up learned: %.0f min, %.2f K rise, "
                 "outdoor %.1f C (episodes=%d)",
-                self.device_name, duration, delta_in, outdoor,
+                self.device_name, source, duration, delta_in, outdoor_avg_c,
                 self.thermal_learner.episode_count,
+            )
+        return recorded
+
+    async def _fetch_significant_states(self, start, end, entity_ids):
+        """History-query seam (mocked in tests).
+
+        Same call as the arrival bootstrap (``scan_history_from_recorder``),
+        plus an end time so the backfill never reads past its cutoff.
+        """
+        from homeassistant.components.recorder import history, get_instance
+
+        return await get_instance(self.hass).async_add_executor_job(
+            history.get_significant_states,
+            self.hass,
+            start,
+            end,
+            entity_ids,
+        )
+
+    def _climate_states_to_samples(self, states) -> list[ClimateSample | None]:
+        """Convert recorder climate states to °C samples.
+
+        A state that is unavailable/unknown, or lacks a numeric setpoint
+        / current temperature, becomes a None break: a gap must close
+        any open session rather than merge two warm-ups across it.
+        The unit is detected once, from the first usable state's
+        attributes (same helper as the live target-setpoint read).
+        """
+        samples: list[ClimateSample | None] = []
+        unit: str | None = None
+        ha_unit = hass_temperature_unit(self.hass)
+        for state in states:
+            if state.state in ("unavailable", "unknown"):
+                samples.append(None)
+                continue
+            attrs = state.attributes or {}
+            if unit is None:
+                unit = detect_climate_unit(attrs, ha_unit)
+            try:
+                setpoint = float(attrs["temperature"])
+                current = float(attrs["current_temperature"])
+                ts = state.last_changed.timestamp()
+            except (KeyError, TypeError, ValueError, AttributeError):
+                samples.append(None)
+                continue
+            samples.append(
+                ClimateSample(
+                    ts=ts,
+                    temp_c=to_celsius(current, unit),
+                    target_c=to_celsius(setpoint, unit),
+                    heating=attrs.get("hvac_action") == "heating",
+                )
+            )
+        return samples
+
+    def _outdoor_states_to_samples(
+        self, states, is_weather: bool
+    ) -> list[tuple[float, float]]:
+        """Convert outdoor-source states to (timestamp, °C) samples.
+
+        Weather entities carry the reading in the ``temperature``
+        attribute; a dedicated sensor carries it in the state itself.
+        Unavailable states and unparseable readings are dropped (the
+        carry-forward merge simply has fewer points to work with).
+        """
+        samples: list[tuple[float, float]] = []
+        unit: str | None = None
+        ha_unit = hass_temperature_unit(self.hass)
+        for state in states:
+            if state.state in ("unavailable", "unknown"):
+                continue
+            attrs = state.attributes or {}
+            if unit is None:
+                unit = detect_outdoor_unit(attrs, ha_unit)
+            raw = attrs.get("temperature") if is_weather else state.state
+            try:
+                value = float(raw)
+                ts = state.last_changed.timestamp()
+            except (TypeError, ValueError, AttributeError):
+                continue
+            samples.append((ts, to_celsius(value, unit)))
+        return samples
+
+    async def _backfill_thermal_history(self) -> None:
+        """One-time bootstrap: learn the thermal model from recorder history.
+
+        The passive observer only learns from warm-ups that complete
+        after the install, so a fresh model sits at zero episodes for
+        days. The recorder already holds the last ~10 days of warm-ups
+        (morning Sleep -> Wake/Home, afternoon Leave -> Home); this
+        reconstructs those sessions with the same rules as the live
+        observer and feeds them through the same
+        ``_feed_warmup_session`` calls. Data-only: nothing about
+        control behaviour changes, and no confidence gate is relaxed —
+        the model reports whatever episode count the history supports.
+
+        Once-only: ``backfill_done`` is set (and saved) BEFORE the
+        work, so one attempt is all there ever is — no retry loop, and
+        a crash mid-feed can never double-count sessions on the next
+        restart. Sessions are reconstructed only up to the cutoff
+        captured when the backfill was scheduled, so a warm-up the live
+        observer is watching can never be fed twice: sessions closing
+        after the cutoff belong to the live observer alone.
+        """
+        if self._backfill_done:
+            return
+        # Mark done first (see docstring): one attempt, then done.
+        self._backfill_done = True
+        await self._async_save_data()
+        try:
+            if self.thermal_learner.episode_count > 0 or self.physics.sample_count > 0:
+                _LOGGER.info(
+                    "[%s] Thermal backfill skipped: model already has %d episode(s)",
+                    self.device_name, self.thermal_learner.episode_count,
+                )
+                return
+            climate = self._get_conf(CONF_CLIMATE)
+            if not climate:
+                _LOGGER.info(
+                    "[%s] Thermal backfill skipped: no climate entity configured",
+                    self.device_name,
+                )
+                return
+            cutoff = self._backfill_cutoff or dt_util.utcnow()
+            start = cutoff - timedelta(days=BACKFILL_DAYS)
+            # Outdoor source, same precedence as _get_outdoor_temp_current.
+            outdoor_entity = self._get_conf(CONF_OUTDOOR_TEMP)
+            outdoor_is_weather = False
+            if not outdoor_entity:
+                outdoor_entity = self._get_conf(CONF_WEATHER_ENTITY)
+                outdoor_is_weather = True
+            entity_ids = [climate] + ([outdoor_entity] if outdoor_entity else [])
+            history_data = await self._fetch_significant_states(start, cutoff, entity_ids)
+            if not history_data:
+                _LOGGER.info(
+                    "[%s] Thermal backfill: no recorder history available",
+                    self.device_name,
+                )
+                return
+            climate_states = history_data.get(climate, []) or []
+            if len(climate_states) > BACKFILL_MAX_STATES:
+                _LOGGER.warning(
+                    "[%s] Thermal backfill: %d climate states, keeping the most recent %d",
+                    self.device_name, len(climate_states), BACKFILL_MAX_STATES,
+                )
+                climate_states = climate_states[-BACKFILL_MAX_STATES:]
+            outdoor_samples: list[tuple[float, float]] = []
+            if outdoor_entity:
+                outdoor_samples = self._outdoor_states_to_samples(
+                    history_data.get(outdoor_entity, []) or [], outdoor_is_weather
+                )
+            samples = attach_outdoor(
+                self._climate_states_to_samples(climate_states), outdoor_samples
+            )
+            sessions = reconstruct_sessions(
+                samples,
+                non_heating_grace_min=PASSIVE_NON_HEATING_GRACE_MIN,
+                setpoint_change_k=PASSIVE_SETPOINT_CHANGE_K,
+                target_tolerance_k=TARGET_REACHED_TOLERANCE,
+            )
+            fed = 0
+            skipped_no_outdoor = 0
+            for session in sessions:
+                if not session.outdoor_known:
+                    # No real outdoor reading covered this session: the
+                    # reconstructed 10.0 C placeholder must never enter
+                    # the regression as if it were measured.
+                    skipped_no_outdoor += 1
+                    continue
+                if await self._feed_warmup_session(
+                    start_ts=session.start_ts,
+                    start_temp_c=session.start_temp_c,
+                    target_c=session.target_c,
+                    end_temp_c=session.end_temp_c,
+                    end_ts=session.end_ts,
+                    outdoor_avg_c=session.outdoor_avg_c,
+                    outdoor_valid=session.outdoor_known,
+                    analyze_deadtime=False,
+                    source="Backfilled",
+                ):
+                    fed += 1
+            _LOGGER.info(
+                "[%s] Thermal backfill: %d episode(s) from %d warm-up session(s) "
+                "(%d skipped: no outdoor coverage) "
+                "in %d climate states (learner episodes=%d, confident=%s)",
+                self.device_name, fed, len(sessions), skipped_no_outdoor,
+                len(climate_states),
+                self.thermal_learner.episode_count, self.thermal_learner.is_confident,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "[%s] Thermal history backfill failed", self.device_name
             )
 
     async def _post_update_tasks(self, ctx: Context, decision: Decision, pred: Prediction) -> None:

@@ -1,0 +1,471 @@
+"""Thermal history backfill (fork v2.14.3).
+
+A fresh thermal model sits at zero episodes for days because the passive
+observer only learns from warm-ups that complete after the install.
+The one-time backfill reconstructs warm-ups from the last 10 days of
+recorder history with the SAME session rules as the live observer and
+feeds them through the same calls. Data-only: no gate is relaxed, so
+the model reports whatever episode count the history supports.
+
+Covered here:
+- pure reconstruction (incl. the Nov 17 15:32 63->71 degF return shape
+  and the Nov 18 mode flaps that must not inflate the count);
+- the coordinator backfill end to end on realistic Nov 10-18 history
+  (15 routine warm-ups + 2 Nov 18 morning sessions, 0 from flaps; the
+  Nov 10 morning session is skipped — no outdoor reading covers it);
+- the once-only flag, the already-learned skip, the zero-history and
+  no-climate cases, and the load-time scheduling hook;
+- the real-physics pins (Fix A): with no valve source the feed path
+  passes valve_position=None so the physics model learns too
+  (sample_count > 0); a real valve sensor reading 0% still keeps the
+  guard (sample_count stays 0) while the learner accumulates episodes;
+- the no-outdoor skip (Fix D): a session with no outdoor coverage is
+  skipped, never fed with the fabricated 10.0 C placeholder.
+"""
+import sys
+import os
+import asyncio
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, AsyncMock
+import unittest
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from test_passive_thermal_learning import _CoordinatorHarness
+from custom_components.preheat.const import (
+    CONF_CLIMATE,
+    CONF_HEATING_PROFILE,
+    CONF_WEATHER_ENTITY,
+    TARGET_REACHED_TOLERANCE,
+)
+from custom_components.preheat.coordinator import (
+    PASSIVE_NON_HEATING_GRACE_MIN,
+    PASSIVE_SETPOINT_CHANGE_K,
+)
+from custom_components.preheat.history_backfill import (
+    ClimateSample,
+    attach_outdoor,
+    reconstruct_sessions,
+)
+from custom_components.preheat.physics import ThermalPhysics
+from custom_components.preheat.const import HEATING_PROFILES, PROFILE_RADIATOR_NEW
+from custom_components.preheat.units import fahrenheit_to_celsius
+
+CLIMATE = "climate.living_room_thermostat"
+WEATHER = "weather.forecast_home"
+
+
+class FakeState:
+    """Minimal recorder State: .state, .last_changed, .attributes."""
+
+    def __init__(self, state, last_changed, attributes=None):
+        self.state = state
+        self.last_changed = last_changed
+        self.attributes = attributes or {}
+
+
+def _sample(minutes, temp_f, target_f, heating, start=None):
+    base = start or datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc)
+    return ClimateSample(
+        ts=(base + timedelta(minutes=minutes)).timestamp(),
+        temp_c=fahrenheit_to_celsius(temp_f),
+        target_c=fahrenheit_to_celsius(target_f),
+        heating=heating,
+    )
+
+
+def _reconstruct(samples):
+    return reconstruct_sessions(
+        samples,
+        non_heating_grace_min=PASSIVE_NON_HEATING_GRACE_MIN,
+        setpoint_change_k=PASSIVE_SETPOINT_CHANGE_K,
+        target_tolerance_k=TARGET_REACHED_TOLERANCE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pure reconstruction
+# ---------------------------------------------------------------------------
+
+class TestReconstructSessions(unittest.TestCase):
+    def test_nov17_afternoon_return_shape(self):
+        """Nov 17 15:32: setpoint 63 -> 71 degF, temp follows to 71."""
+        sessions = _reconstruct([
+            _sample(0, 63, 63, False),
+            _sample(32, 64, 71, True),
+            _sample(60, 66, 71, True),
+            _sample(90, 69, 71, True),
+            _sample(110, 71, 71, True),
+        ])
+        assert len(sessions) == 1
+        s = sessions[0]
+        assert abs((s.end_temp_c - s.start_temp_c)
+                   - (fahrenheit_to_celsius(71) - fahrenheit_to_celsius(64))) < 0.01
+        assert abs((s.end_ts - s.start_ts) / 60.0 - 78.0) < 0.01
+        assert s.target_c == fahrenheit_to_celsius(71)
+
+    def test_mode_flaps_produce_no_qualifying_session(self):
+        """Nov 18 flaps: 62 <-> 70 step-ups within minutes. The state
+        machine closes each flap quickly; the rises are too small for
+        an episode (the feed-time guard rejects them)."""
+        sessions = _reconstruct([
+            _sample(0, 65, 70, True),
+            _sample(8, 65.5, 62, True),
+            _sample(20, 65.5, 70, True),
+            _sample(25, 65.5, 62, False),
+        ])
+        assert len(sessions) == 2
+        for s in sessions:
+            assert (s.end_temp_c - s.start_temp_c) < 0.3  # MIN_DELTA_K
+            assert (s.end_ts - s.start_ts) / 60.0 <= 8.0
+
+    def test_long_idle_closes_session(self):
+        """Burner off >= 5 min ends the session at the temp reached."""
+        sessions = _reconstruct([
+            _sample(0, 66, 71, True),
+            _sample(30, 68, 71, True),
+            _sample(32, 68.5, 71, False),
+            _sample(37, 68.5, 71, False),
+        ])
+        assert len(sessions) == 1
+        assert abs((sessions[0].end_ts - sessions[0].start_ts) / 60.0 - 37.0) < 0.01
+
+    def test_brief_idle_does_not_end_session(self):
+        """2 min idle mid warm-up: the session survives to the target."""
+        sessions = _reconstruct([
+            _sample(0, 66, 71, True),
+            _sample(30, 68, 71, True),
+            _sample(32, 68.5, 71, False),
+            _sample(34, 68.5, 71, True),
+            _sample(65, 71, 71, True),
+        ])
+        assert len(sessions) == 1
+
+    def test_break_closes_session(self):
+        """An unavailable gap closes the session at the last good sample
+        instead of merging two warm-ups across it."""
+        sessions = _reconstruct([
+            _sample(0, 66, 71, True),
+            _sample(30, 68, 71, True),
+            None,
+            _sample(120, 66, 71, True),
+            _sample(180, 71, 71, True),
+        ])
+        assert len(sessions) == 2
+        assert abs((sessions[0].end_ts - sessions[0].start_ts) / 60.0 - 30.0) < 0.01
+
+    def test_unclosed_session_is_discarded(self):
+        """A warm-up still running at the end of the window is not fed."""
+        sessions = _reconstruct([
+            _sample(0, 66, 71, True),
+            _sample(30, 68, 71, True),
+        ])
+        assert sessions == []
+
+    def test_setpoint_move_splits_session(self):
+        """Target 71 -> 72 mid warm-up: first session closes, a second
+        opens from the current temperature (no double-counted rise)."""
+        sessions = _reconstruct([
+            _sample(0, 66, 71, True),
+            _sample(30, 68, 71, True),
+            _sample(31, 68, 72, True),
+            _sample(70, 71.5, 72, True),
+            _sample(75, 72, 72, True),
+        ])
+        assert len(sessions) == 2
+        assert sessions[0].end_temp_c == sessions[1].start_temp_c
+
+    def test_attach_outdoor_carry_forward(self):
+        """Sparse outdoor samples carry forward to the climate samples."""
+        base = datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc)
+        samples = attach_outdoor(
+            [
+                ClimateSample((base).timestamp(), 18.0, 21.0, True),
+                ClimateSample((base + timedelta(minutes=30)).timestamp(), 19.0, 21.0, True),
+                ClimateSample((base + timedelta(minutes=90)).timestamp(), 20.0, 21.0, True),
+            ],
+            [
+                ((base - timedelta(hours=1)).timestamp(), 7.0),
+                ((base + timedelta(minutes=60)).timestamp(), 5.0),
+            ],
+        )
+        assert samples[0].outdoor_c == 7.0
+        assert samples[1].outdoor_c == 7.0
+        assert samples[2].outdoor_c == 5.0
+
+    def test_attach_outdoor_none_before_first_sample(self):
+        """Climate samples before any outdoor reading stay unknown."""
+        base = datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc)
+        samples = attach_outdoor(
+            [ClimateSample(base.timestamp(), 18.0, 21.0, True)],
+            [((base + timedelta(minutes=60)).timestamp(), 5.0)],
+        )
+        assert samples[0].outdoor_c is None
+
+
+# ---------------------------------------------------------------------------
+# Coordinator backfill end to end
+# ---------------------------------------------------------------------------
+
+def _climate_state(day, hh, mm, setpoint_f, current_f, action):
+    return FakeState(
+        "heat",
+        datetime(2026, 11, day, hh, mm, tzinfo=timezone.utc),
+        {
+            "temperature": float(setpoint_f),
+            "current_temperature": float(current_f),
+            "hvac_action": action,
+            "min_temp": 45,
+            "max_temp": 92,
+        },
+    )
+
+
+def _weather_state(day, hh, mm, temp_f):
+    return FakeState(
+        "cloudy",
+        datetime(2026, 11, day, hh, mm, tzinfo=timezone.utc),
+        {"temperature": float(temp_f), "temperature_unit": "°F"},
+    )
+
+
+def _nov_10_to_18_history():
+    """Realistic Nov 10-18 history: 8 days x morning + afternoon
+    warm-ups, Nov 18 morning sessions, Nov 18 midday mode flaps.
+    The Nov 10 morning session has no outdoor coverage (first weather
+    reading is Nov 10 12:00), so Fix D skips it: 17 episodes fed."""
+    climate = []
+    for day in range(10, 18):  # Nov 10-17
+        climate += [
+            _climate_state(day, 5, 0, 68, 68, "idle"),
+            _climate_state(day, 5, 30, 71, 68, "heating"),
+            _climate_state(day, 6, 0, 71, 69.5, "heating"),
+            _climate_state(day, 6, 40, 71, 71, "heating"),
+            _climate_state(day, 9, 0, 63, 71, "idle"),
+            _climate_state(day, 12, 0, 63, 68, "idle"),
+            _climate_state(day, 15, 30, 71, 65, "heating"),
+            _climate_state(day, 16, 0, 71, 68, "heating"),
+            _climate_state(day, 16, 30, 71, 70, "heating"),
+            _climate_state(day, 16, 50, 71, 71, "heating"),
+            _climate_state(day, 22, 0, 68, 71, "idle"),
+        ]
+    # Nov 18 morning (live observations: 05:08 67->69, 06:30 69->70,
+    # 06:38 69->71, then warm to 71).
+    climate += [
+        _climate_state(18, 5, 8, 69, 67, "heating"),
+        _climate_state(18, 5, 40, 69, 68, "heating"),
+        _climate_state(18, 6, 20, 69, 69, "heating"),
+        _climate_state(18, 6, 30, 70, 69, "heating"),
+        _climate_state(18, 6, 38, 71, 69, "heating"),
+        _climate_state(18, 7, 10, 71, 70, "heating"),
+        _climate_state(18, 7, 30, 71, 71, "heating"),
+        # Nov 18 midday mode flaps: 62 <-> 70 within minutes.
+        _climate_state(18, 11, 0, 70, 65, "heating"),
+        _climate_state(18, 11, 8, 62, 65.5, "heating"),
+        _climate_state(18, 11, 20, 70, 65.5, "heating"),
+        _climate_state(18, 11, 25, 62, 65.5, "idle"),
+    ]
+    weather = [
+        _weather_state(10, 12, 0, 45),
+        _weather_state(14, 12, 0, 40),
+        _weather_state(18, 12, 0, 47),
+    ]
+    return {CLIMATE: climate, WEATHER: weather}
+
+
+class TestThermalBackfill(_CoordinatorHarness):
+    def setUp(self):
+        super().setUp()
+        self.coord._async_save_data = AsyncMock()
+        self.coord.physics.sample_count = 0
+        self.coord.entry.options[CONF_CLIMATE] = CLIMATE
+        self.coord.entry.options[CONF_WEATHER_ENTITY] = WEATHER
+        self.coord._backfill_cutoff = datetime(2026, 11, 18, 20, 0, tzinfo=timezone.utc)
+        self.coord._fetch_significant_states = AsyncMock(
+            return_value=_nov_10_to_18_history()
+        )
+
+    async def test_backfill_feeds_17_episodes_and_confident(self):
+        """15 routine warm-ups + 2 Nov 18 morning sessions; the flaps
+        add nothing, and the Nov 10 morning session is skipped (no
+        outdoor coverage). The learner becomes confident (>= 5 episodes)."""
+        await self.coord._backfill_thermal_history()
+        assert self.coord.thermal_learner.episode_count == 17
+        assert self.coord.thermal_learner.is_confident is True
+        rate = self.coord.thermal_learner.reference_heating_rate_f_per_h()
+        assert rate is not None
+        assert 0.5 < rate < 10.0
+        assert self.coord._backfill_done is True
+        assert self.coord._async_save_data.await_count >= 1
+
+    async def test_backfill_queries_last_10_days_to_cutoff(self):
+        """History window is (cutoff - 10 days) .. cutoff, both entities."""
+        await self.coord._backfill_thermal_history()
+        args = self.coord._fetch_significant_states.await_args.args
+        assert args[0] == datetime(2026, 11, 8, 20, 0, tzinfo=timezone.utc)
+        assert args[1] == datetime(2026, 11, 18, 20, 0, tzinfo=timezone.utc)
+        assert args[2] == [CLIMATE, WEATHER]
+
+    async def test_backfill_runs_once_only(self):
+        """A second call does nothing: no second history fetch."""
+        await self.coord._backfill_thermal_history()
+        assert self.coord._fetch_significant_states.await_count == 1
+        await self.coord._backfill_thermal_history()
+        assert self.coord._fetch_significant_states.await_count == 1
+        assert self.coord.thermal_learner.episode_count == 17
+
+    async def test_backfill_skipped_when_model_has_episodes(self):
+        """The live observer got there first: no fetch, flag set."""
+        self.coord.thermal_learner.record_episode(70.0, 1.7, 5.0, 15.0)
+        assert self.coord.thermal_learner.episode_count == 1
+        await self.coord._backfill_thermal_history()
+        assert self.coord._fetch_significant_states.await_count == 0
+        assert self.coord.thermal_learner.episode_count == 1
+        assert self.coord._backfill_done is True
+
+    async def test_backfill_empty_history_is_not_a_crash(self):
+        """No recorder history: 0 episodes, flag set, no retry loop."""
+        self.coord._fetch_significant_states = AsyncMock(return_value={})
+        await self.coord._backfill_thermal_history()
+        assert self.coord.thermal_learner.episode_count == 0
+        assert self.coord._backfill_done is True
+
+    async def test_backfill_no_climate_entity(self):
+        """No climate entity configured: nothing to read, flag set."""
+        del self.coord.entry.options[CONF_CLIMATE]
+        await self.coord._backfill_thermal_history()
+        assert self.coord._fetch_significant_states.await_count == 0
+        assert self.coord._backfill_done is True
+
+    async def test_backfill_fetch_failure_is_not_a_crash(self):
+        """Recorder error: logged, flag set, model untouched."""
+        self.coord._fetch_significant_states = AsyncMock(
+            side_effect=RuntimeError("recorder down")
+        )
+        await self.coord._backfill_thermal_history()
+        assert self.coord.thermal_learner.episode_count == 0
+        assert self.coord._backfill_done is True
+
+    async def test_valveless_house_physics_learns_from_backfill(self):
+        """Fix A: with no valve source at all the feed path passes
+        valve_position=None, so the physics model learns too — its
+        sample_count rises alongside the learner's episodes. (Before
+        the fix the fallback fed 0.0 and the valve guard rejected
+        every warm-up, so sample_count stayed 0.)"""
+        self.coord.physics = ThermalPhysics(
+            profile_data=HEATING_PROFILES[PROFILE_RADIATOR_NEW],
+            learning_rate=0.1,
+        )
+        # Restore the real valve average (harness mocks it to 80.0):
+        # the live buffer holds no points for historical windows.
+        del self.coord.history_buffer.get_average_valve
+        # No valve source anywhere (harness mocks this to 0.0).
+        self.coord._get_valve_position = MagicMock(return_value=None)
+        await self.coord._backfill_thermal_history()
+        assert self.coord.thermal_learner.episode_count == 17
+        assert self.coord.physics.sample_count > 0
+
+    async def test_valve_sensor_at_zero_percent_still_rejects(self):
+        """Fix A guard: a real valve sensor reading 0% is NOT the
+        valveless case — the 0.0 keeps the physics valve guard, so
+        sample_count stays 0 while the learner still accumulates
+        episodes from the same warm-ups."""
+        self.coord.physics = ThermalPhysics(
+            profile_data=HEATING_PROFILES[PROFILE_RADIATOR_NEW],
+            learning_rate=0.1,
+        )
+        del self.coord.history_buffer.get_average_valve
+        # A real valve source exists and reads 0% (harness default).
+        self.coord._get_valve_position = MagicMock(return_value=0.0)
+        await self.coord._backfill_thermal_history()
+        assert self.coord.thermal_learner.episode_count == 17
+        assert self.coord.physics.sample_count == 0
+
+    async def test_backfill_skips_session_with_no_outdoor_coverage(self):
+        """Fix D: a session with no outdoor coverage is skipped, not
+        fed with the fabricated 10.0 C placeholder. Morning warm-up
+        before any outdoor reading + afternoon warm-up after one:
+        only the afternoon episode is fed."""
+        history = {
+            CLIMATE: [
+                # Morning warm-up, before the first outdoor reading.
+                _climate_state(10, 5, 0, 68, 68, "idle"),
+                _climate_state(10, 5, 30, 71, 68, "heating"),
+                _climate_state(10, 6, 0, 71, 69.5, "heating"),
+                _climate_state(10, 6, 40, 71, 71, "heating"),
+                # Afternoon warm-up, after the first outdoor reading.
+                _climate_state(10, 15, 30, 71, 65, "heating"),
+                _climate_state(10, 16, 0, 71, 68, "heating"),
+                _climate_state(10, 16, 50, 71, 71, "heating"),
+                _climate_state(10, 22, 0, 68, 71, "idle"),
+            ],
+            WEATHER: [_weather_state(10, 12, 0, 45)],
+        }
+        self.coord._fetch_significant_states = AsyncMock(return_value=history)
+        await self.coord._backfill_thermal_history()
+        assert self.coord.thermal_learner.episode_count == 1
+
+    async def test_fetch_seam_uses_recorder_api(self):
+        """The history seam calls get_significant_states through the
+        recorder instance's executor job, as the arrival bootstrap does."""
+        # Save whatever another test module installed here at import time
+        # (test_retroactive_learning.py) and restore it afterwards.
+        prev_recorder = sys.modules.get("homeassistant.components.recorder")
+
+        def _restore_recorder():
+            if prev_recorder is None:
+                sys.modules.pop("homeassistant.components.recorder", None)
+            else:
+                sys.modules["homeassistant.components.recorder"] = prev_recorder
+
+        sys.modules["homeassistant.components.recorder"] = MagicMock()
+        self.addCleanup(_restore_recorder)
+        mock_recorder = sys.modules["homeassistant.components.recorder"]
+        mock_instance = MagicMock()
+        mock_recorder.get_instance.return_value = mock_instance
+        mock_recorder.history = MagicMock()
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        future.set_result(_nov_10_to_18_history())
+        mock_instance.async_add_executor_job = MagicMock(return_value=future)
+        start = datetime(2026, 11, 8, 20, 0, tzinfo=timezone.utc)
+        end = datetime(2026, 11, 18, 20, 0, tzinfo=timezone.utc)
+        # Call the real seam (not the AsyncMock from setUp).
+        data = await self.coord.__class__._fetch_significant_states(
+            self.coord, start, end, [CLIMATE, WEATHER]
+        )
+        assert set(data.keys()) == {CLIMATE, WEATHER}
+        mock_instance.async_add_executor_job.assert_called_once()
+        call_args = mock_instance.async_add_executor_job.call_args.args
+        assert call_args[0] is mock_recorder.history.get_significant_states
+        assert call_args[2] == start
+        assert call_args[3] == end
+        assert call_args[4] == [CLIMATE, WEATHER]
+
+
+class TestBackfillScheduling(_CoordinatorHarness):
+    def setUp(self):
+        super().setUp()
+        self.coord._store.async_load = AsyncMock(return_value={})
+
+    async def test_fresh_install_schedules_backfill(self):
+        """Empty store: the backfill is scheduled (cutoff captured).
+        The arrival bootstrap is scheduled alongside it — both at 30 s,
+        so call_later fires twice on a fresh install."""
+        await self.coord.async_load_data()
+        assert self.coord._backfill_cutoff is not None
+        assert self.coord._backfill_done is False
+        assert self.hass.loop.call_later.call_count == 2
+        for call in self.hass.loop.call_later.call_args_list:
+            assert call.args[0] == 30
+
+    async def test_flagged_done_does_not_schedule(self):
+        """Store says done: no backfill scheduling (cutoff stays None).
+        Only the arrival bootstrap is scheduled."""
+        self.coord._store.async_load = AsyncMock(
+            return_value={"backfill_done": True}
+        )
+        await self.coord.async_load_data()
+        assert self.coord._backfill_done is True
+        assert self.coord._backfill_cutoff is None
+        assert self.hass.loop.call_later.call_count == 1
