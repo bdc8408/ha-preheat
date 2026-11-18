@@ -157,14 +157,26 @@ class CoolingAnalyzer:
                     prev = current_segment[-1]
                     dt_min = (pt["dt"] - prev["dt"]).total_seconds() / 60.0
                     
-                    # Check time gap and temperature rate cap (<= 0.5 K/min)
+                    # Check time gap and temperature rate cap.
+                    # Fork (v2.14.2): the cap is 1.0 K/min, not 0.5.
+                    # The Ecobee/HomeKit operative temperature is
+                    # quantized to 1 degF (0.56 K), so a single
+                    # quantization step in one minute is 0.56 K/min —
+                    # above the old 0.5 cap. The reading dithers
+                    # 70<->71 degF every few minutes all night, so the
+                    # old cap split the buffer at nearly every dither
+                    # and no segment ever reached the 60-minute minimum
+                    # (verified against the real Nov 17-18 overnight
+                    # history). 1.0 K/min still rejects genuine
+                    # glitches (several degF per minute); no real
+                    # house cools anywhere near 1 K/min.
                     if dt_min < 1.0 or dt_min > 60.0:
                         if self._is_segment_valid(current_segment):
                             segments.append(current_segment)
                         current_segment = [pt]
                     else:
                         rate = (prev["t_in"] - pt["t_in"]) / dt_min
-                        if rate > 0.5 or rate < -0.5:
+                        if rate > 1.0 or rate < -1.0:
                             if self._is_segment_valid(current_segment):
                                 segments.append(current_segment)
                             current_segment = [pt]

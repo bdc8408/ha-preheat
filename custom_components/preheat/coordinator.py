@@ -136,7 +136,7 @@ from .planner import PreheatPlanner
 from .patterns import MIN_CLUSTER_POINTS
 from .physics import ThermalPhysics, ThermalModelData
 from .schedule_learner import ScheduleLearner, day_type_for
-from .thermal_learner import ThermalLearner
+from .thermal_learner import ThermalLearner, MIN_DELTA_K
 from .history_buffer import RingBuffer, DeadtimeAnalyzer, HistoryPoint
 from .weather_service import WeatherService
 from .optimal_stop import OptimalStopManager
@@ -154,6 +154,14 @@ _LOGGER = logging.getLogger(__name__)
 
 STORAGE_VERSION = 4 
 STORAGE_KEY_TEMPLATE = "preheat.{}"
+
+# Fork (v2.14.2, passive thermal learning): a blueprint-driven warm-up
+# only counts as ended once the burner has been off for this long
+# (covers the fan run-on after a heating call ends).
+PASSIVE_NON_HEATING_GRACE_MIN = 5.0
+# A setpoint move larger than this ends the current warm-up session
+# (the next cycle opens a fresh one from the current temperature).
+PASSIVE_SETPOINT_CHANGE_K = 0.5
 
 def _next_time_of_day(now: datetime, minutes: int) -> datetime:
     """Next datetime at ``minutes`` since local midnight.
@@ -340,6 +348,13 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         # Moment/temperature at which the current run reached the target (None = not yet)
         self._target_reached_at: datetime | None = None
         self._target_reached_temp: float | None = None
+        # Fork (v2.14.2, passive thermal learning): the currently
+        # observed blueprint-driven warm-up, if any. In-memory only:
+        # a restart mid-session just loses that one episode.
+        # Shape: {start_ts, start_temp_c, target_c, outdoor_sum_c,
+        # outdoor_n, non_heating_since}.
+        self._passive_warmup: dict | None = None
+        self._passive_episodes: int = 0
         # self._occupancy_on_since: datetime | None = None # Moved to SessionManager
         self._preheat_active: bool = False
         self._frost_active: bool = False # Safety override (v2.9.1)
@@ -1643,9 +1658,34 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
         house_source = "none"
         if self.house_collector:
             house_next_event, house_conf, house_source = self.house_collector.get_next_arrival(now)
-            
+
         has_confident_house = (house_next_event is not None and house_conf >= 0.7)
-        has_house_fallback = (house_next_event is not None and house_source == "fallback")
+        has_house_fallback = house_next_event is not None and house_source in (
+            "fallback",
+            "learned_fallback",
+        )
+
+        # Fork (v2.14.2, passive thermal learning): when the house
+        # collector has no usable prediction, fall back to the Phase 4
+        # learned schedule's next arrival. The collector is starved
+        # (no confident prediction, no fallback window), while the
+        # learner already predicts the return — without this the
+        # preheat decision has no next event at all and never
+        # schedules. Enters the existing confident/fallback
+        # arbitration branches unchanged (see
+        # _learned_house_prediction for the source strings).
+        if not has_confident_house and not has_house_fallback:
+            learned_event, learned_conf, learned_source = self._learned_house_prediction(
+                now, is_occupied
+            )
+            if learned_event is not None:
+                house_next_event, house_conf, house_source = (
+                    learned_event,
+                    learned_conf,
+                    learned_source,
+                )
+                has_confident_house = learned_conf >= 0.7
+                has_house_fallback = learned_source == "learned_fallback"
         
         if schedule_next_start is not None:
             next_event = schedule_next_start
@@ -1682,10 +1722,44 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
             "is_sensor_ready": is_ready, "forecasts": forecasts, "preheat_active": self._preheat_active,
             "has_confident_house": has_confident_house, "house_confidence": house_conf,
             "house_next_event": house_next_event, "zone_next_event": zone_next_event,
-            "has_house_fallback": has_house_fallback, "house_source": house_source,
+            "has_house_fallback": has_house_fallback,
+            "house_source": house_source,
             "hvac_action": hvac_action, "hvac_mode": hvac_mode,
             "schedule_next_start": schedule_next_start, "next_event_source": next_event_source,
         }
+
+    def _learned_house_prediction(
+        self, now: datetime, is_occupied: bool
+    ) -> tuple[datetime | None, float, str]:
+        """Next arrival from the Phase 4 learned schedule.
+
+        Returns (event, confidence, source) or (None, 0.0, "none").
+        Source is "learned" when the prediction confidence clears the
+        house threshold (0.7) and "learned_fallback" below it, so the
+        existing confident/fallback arbitration branches apply
+        unchanged. Only arrivals count: a predicted departure is not
+        an event to preheat for, and when the house is occupied there
+        is no arrival to preheat for. Away mode is excluded: the
+        return warm-up is driven by the separate away signal, and the
+        routine learner is not fed while away.
+        """
+        if is_occupied or self.away_mode:
+            return None, 0.0, "none"
+        try:
+            nxt, kind, conf = self.schedule_learner.predict_next_transition(now)
+        except (AttributeError, TypeError, ValueError):
+            return None, 0.0, "none"
+        if nxt is None or kind != "arrival" or nxt <= now:
+            return None, 0.0, "none"
+        conf = float(conf) if isinstance(conf, (int, float)) else 0.0
+        # Confidence 0 means the learner has finalized no day yet:
+        # the prediction is the fixed-schedule prior alone, and the
+        # prior must never drive preheat (it would otherwise hijack
+        # next_event on day one, before any routine exists).
+        if conf <= 0.0:
+            return None, 0.0, "none"
+        source = "learned" if conf >= 0.7 else "learned_fallback"
+        return nxt, conf, source
 
     @staticmethod
     def _is_excluded_day(
@@ -2040,7 +2114,11 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                 "house": {
                     "is_valid": has_confident_house,
                     "confidence": house_conf,
-                    "next_event": house_next_event.isoformat() if house_next_event else None
+                    "next_event": house_next_event.isoformat() if house_next_event else None,
+                    # Fork (v2.14.2): "learned" / "learned_fallback"
+                    # when the event came from the Phase 4 schedule
+                    # instead of the house collector.
+                    "source": ctx.get("house_source", "none"),
                 }
             },
             KEY_GATES_FAILED: gates_failed,
@@ -2758,6 +2836,136 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                         except ValueError: pass
         return None
 
+    # -- Fork (v2.14.2): passive thermal learning ----------------------
+
+    async def _observe_passive_warmup(self, ctx: Context) -> None:
+        """Observe blueprint-driven warm-ups and learn from them.
+
+        The thermal model only ever learned from integration-driven
+        preheat runs (_stop_preheat), and none ever ran — a bootstrap
+        deadlock. The blueprint warms the house every morning
+        (Sleep -> Wake / Home) and every afternoon (Leave -> Home);
+        those warm-ups are the same physics. This observer watches
+        the climate entity each cycle and, when a warm-up ends, feeds
+        the SAME calls _stop_preheat makes
+        (physics.update_model + thermal_learner.record_episode) and
+        persists.
+
+        Data-only: recording an episode changes no control
+        behaviour. The fitted rate is only used once the learner is
+        confident (>= 5 episodes) and agrees with the physics model
+        within 50% (see _run_physics_simulation). Away-mode
+        deep-setback recoveries count: the house's heating rate does
+        not depend on why the house was cold.
+        """
+        # Integration-driven runs are learned by _stop_preheat; never
+        # double-feed. If one starts mid-session, abandon the passive
+        # session — the run's own learning covers it.
+        if self._preheat_active:
+            self._passive_warmup = None
+            return
+        # Same guard as _stop_preheat: a window open recently means
+        # the warm-up is not a clean heating episode.
+        if self._window_open_detected:
+            if self._passive_warmup is not None:
+                _LOGGER.debug("[%s] Passive warm-up discarded: window open", self.device_name)
+                self._passive_warmup = None
+            return
+
+        now = ctx["now"]
+        op_temp = ctx["operative_temp"]
+        target = ctx["target_setpoint"]
+        outdoor = ctx["outdoor_temp"] if ctx["outdoor_temp"] is not None else 10.0
+        heating = ctx.get("hvac_action") == "heating"
+        session = self._passive_warmup
+
+        if session is None:
+            if heating and op_temp < target - TARGET_REACHED_TOLERANCE:
+                self._passive_warmup = {
+                    "start_ts": now.timestamp(),
+                    "start_temp_c": op_temp,
+                    "target_c": target,
+                    "outdoor_sum_c": outdoor,
+                    "outdoor_n": 1,
+                    "non_heating_since": None,
+                }
+            return
+
+        # A setpoint move ends the session against the temperature
+        # achieved so far; the next cycle opens a fresh session.
+        if abs(target - session["target_c"]) > PASSIVE_SETPOINT_CHANGE_K:
+            await self._close_passive_warmup(op_temp, now)
+            return
+        # Target reached (or the setpoint dropped to/below the current
+        # temperature): the warm-up is over.
+        if target <= op_temp + TARGET_REACHED_TOLERANCE:
+            await self._close_passive_warmup(op_temp, now)
+            return
+
+        session["outdoor_sum_c"] += outdoor
+        session["outdoor_n"] += 1
+        if heating:
+            session["non_heating_since"] = None
+            return
+        if session["non_heating_since"] is None:
+            session["non_heating_since"] = now
+            return
+        idle_min = (now - session["non_heating_since"]).total_seconds() / 60.0
+        if idle_min >= PASSIVE_NON_HEATING_GRACE_MIN:
+            await self._close_passive_warmup(op_temp, now)
+
+    async def _close_passive_warmup(self, end_temp: float, end: datetime) -> None:
+        """Feed one completed passive warm-up to the thermal model.
+
+        Mirrors the learning block of _stop_preheat: same guards
+        (rise >= MIN_DELTA_K, plausible rate, deadtime), same calls
+        (physics.update_model, thermal_learner.record_episode), same
+        persistence. Returns silently when the session does not
+        qualify — short top-up cycles and sub-degree rises are not
+        episodes.
+        """
+        session = self._passive_warmup
+        self._passive_warmup = None
+        if session is None:
+            return
+        start_ts = session["start_ts"]
+        duration = max(0.0, (end.timestamp() - start_ts) / 60.0)
+        delta_in = end_temp - session["start_temp_c"]
+        outdoor = session["outdoor_sum_c"] / max(1, session["outdoor_n"])
+        target = session["target_c"]
+        if delta_in < MIN_DELTA_K:
+            _LOGGER.debug(
+                "[%s] Passive warm-up skipped: rise %.2f K too small",
+                self.device_name, delta_in,
+            )
+            return
+        # Deadtime analysis over the warm-up, as in _stop_preheat.
+        new_deadtime = self.deadtime_analyzer.analyze(self.history_buffer.get_all())
+        if new_deadtime:
+            self.physics.update_deadtime(new_deadtime)
+        delta_out = target - outdoor
+        valve_pos_avg = self.history_buffer.get_average_valve(start_ts, end.timestamp())
+        if valve_pos_avg is None:
+            valve_pos_avg = self._get_valve_position_with_fallback("passive")
+        success = self.physics.update_model(
+            duration, delta_in, delta_out, valve_pos_avg,
+            outdoor_valid=self._outdoor_is_real,
+        )
+        recorded = self.thermal_learner.record_episode(
+            duration, delta_in, outdoor, self.physics.deadtime
+        )
+        if recorded:
+            self._passive_episodes += 1
+        if success or recorded:
+            self.diagnostics.data["last_learning_attempt_ts"] = dt_util.utcnow().timestamp()
+            await self._async_save_data()
+            _LOGGER.info(
+                "[%s] Passive warm-up learned: %.0f min, %.2f K rise, "
+                "outdoor %.1f C (episodes=%d)",
+                self.device_name, duration, delta_in, outdoor,
+                self.thermal_learner.episode_count,
+            )
+
     async def _post_update_tasks(self, ctx: Context, decision: Decision, pred: Prediction) -> None:
         """Run tasks after main update loop (non-critical)."""
         # 1. Update Polling
@@ -2821,6 +3029,11 @@ class PreheatingCoordinator(DataUpdateCoordinator[PreheatData]):
                     _LOGGER.info("Cooling analyzer learned new parameters: tau=%.2fh, confidence=%.1f%%", 
                                  self.cooling_analyzer.learned_tau, self.cooling_analyzer.confidence * 100)
                     await self._async_save_data()
+
+        # 5. Fork (v2.14.2): passive thermal learning — observe
+        # blueprint-driven warm-ups (data-only; see
+        # _observe_passive_warmup).
+        await self._observe_passive_warmup(ctx)
 
     def _update_polling_interval(self, next_start: datetime | None, is_occupied: bool) -> None:
         """
